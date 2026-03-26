@@ -1,8 +1,11 @@
+use std::collections::HashSet;
+
 use indexmap::IndexMap;
 use serde_json::Value;
 
-use crate::error::{VtfError, VtfResult};
-use crate::model::*;
+use crate::core::error::{VtfError, VtfResult};
+use crate::core::model::*;
+use crate::query::ast::Expr;
 
 impl VtfTable {
     /// Return a reference to the column data for a given column name.
@@ -19,13 +22,11 @@ impl VtfTable {
             return Err(VtfError::query(format!("column '{column}' not found")));
         }
 
-        // Try index-accelerated path
         if let Some(idx) = self.indexes.get(column) {
             let key = value_to_search_key(value);
             return Ok(idx.map.get(&key).cloned().unwrap_or_default());
         }
 
-        // Linear scan
         let col_data = &self.data[column];
         let mut matches = Vec::new();
         for i in 0..self.row_count {
@@ -75,6 +76,107 @@ impl VtfTable {
     }
 }
 
+impl VtfTable {
+    /// Evaluate a query expression and return matching row indices.
+    pub fn eval_expr(&self, expr: &Expr) -> VtfResult<Vec<usize>> {
+        match expr {
+            Expr::Eq { column, value } => self.filter_eq(column, value),
+
+            Expr::Neq { column, value } => {
+                self.validate_column(column)?;
+                let eq_matches: HashSet<usize> = self.filter_eq(column, value)?.into_iter().collect();
+                Ok((0..self.row_count).filter(|i| !eq_matches.contains(i)).collect())
+            }
+
+            Expr::Gt { column, value } => self.filter_cmp(column, value, false, false),
+            Expr::Gte { column, value } => self.filter_cmp(column, value, false, true),
+            Expr::Lt { column, value } => self.filter_cmp(column, value, true, false),
+            Expr::Lte { column, value } => self.filter_cmp(column, value, true, true),
+
+            Expr::And(left, right) => {
+                let l: HashSet<usize> = self.eval_expr(left)?.into_iter().collect();
+                let r: HashSet<usize> = self.eval_expr(right)?.into_iter().collect();
+                let mut result: Vec<usize> = l.intersection(&r).copied().collect();
+                result.sort_unstable();
+                Ok(result)
+            }
+
+            Expr::Or(left, right) => {
+                let l: HashSet<usize> = self.eval_expr(left)?.into_iter().collect();
+                let r: HashSet<usize> = self.eval_expr(right)?.into_iter().collect();
+                let mut result: Vec<usize> = l.union(&r).copied().collect();
+                result.sort_unstable();
+                Ok(result)
+            }
+
+            Expr::Not(inner) => {
+                let matches: HashSet<usize> = self.eval_expr(inner)?.into_iter().collect();
+                Ok((0..self.row_count).filter(|i| !matches.contains(i)).collect())
+            }
+        }
+    }
+
+    fn validate_column(&self, column: &str) -> VtfResult<()> {
+        if !self.data.contains_key(column) {
+            return Err(VtfError::query(format!("column '{column}' not found")));
+        }
+        Ok(())
+    }
+
+    /// Compare rows against a value. `is_less` = true means we want rows < value (or <=).
+    /// `inclusive` determines strict vs non-strict.
+    fn filter_cmp(&self, column: &str, value: &Value, is_less: bool, inclusive: bool) -> VtfResult<Vec<usize>> {
+        self.validate_column(column)?;
+        let col_data = &self.data[column];
+
+        // Try sorted index if available
+        if let Some(idx) = self.indexes.get(column) {
+            if idx.sorted_keys.is_some() {
+                let search_key = value_to_search_key(value);
+                let rows = if is_less {
+                    crate::index::sorted::range_query(idx, None, Some(&search_key), true, inclusive)
+                } else {
+                    crate::index::sorted::range_query(idx, Some(&search_key), None, inclusive, true)
+                };
+                return Ok(rows);
+            }
+        }
+
+        // Linear scan
+        let mut matches = Vec::new();
+        for i in 0..self.row_count {
+            let cell = col_data.get_json_value(i).unwrap_or(Value::Null);
+            if cell.is_null() {
+                continue;
+            }
+            let ord = compare_values(&cell, value);
+            let pass = match ord {
+                Some(std::cmp::Ordering::Less) => is_less,
+                Some(std::cmp::Ordering::Equal) => inclusive,
+                Some(std::cmp::Ordering::Greater) => !is_less,
+                None => false,
+            };
+            if pass {
+                matches.push(i);
+            }
+        }
+        Ok(matches)
+    }
+}
+
+fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Number(an), Value::Number(bn)) => {
+            let af = an.as_f64()?;
+            let bf = bn.as_f64()?;
+            af.partial_cmp(&bf)
+        }
+        (Value::String(a_s), Value::String(b_s)) => Some(a_s.cmp(b_s)),
+        (Value::Bool(a_b), Value::Bool(b_b)) => Some(a_b.cmp(b_b)),
+        _ => None,
+    }
+}
+
 fn value_to_search_key(val: &Value) -> String {
     match val {
         Value::Number(n) => n.to_string(),
@@ -101,7 +203,7 @@ fn values_match(cell: &Value, search: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::validation;
+    use crate::storage::validation;
 
     fn test_table() -> crate::VtfTable {
         let j = serde_json::json!({

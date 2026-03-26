@@ -1,5 +1,5 @@
-use crate::error::{VtfError, VtfResult};
-use crate::model::*;
+use crate::core::error::{VtfError, VtfResult};
+use crate::core::model::*;
 
 impl VtfTable {
     /// Add a new column to the table. Existing rows are backfilled with null.
@@ -27,7 +27,7 @@ impl VtfTable {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::*;
+    use crate::core::model::*;
 
     #[test]
     fn test_add_column_empty_table() {
@@ -48,7 +48,6 @@ mod tests {
             col_type: ColumnType::Int,
         }];
         let mut table = VtfTable::new(columns);
-        // Manually add rows
         if let Some(ColumnData::Int(ref mut v)) = table.data.get_mut("id") {
             v.push(Some(1));
             v.push(Some(2));
@@ -58,7 +57,6 @@ mod tests {
         table.add_column("name", ColumnType::String).unwrap();
         let name_data = &table.data["name"];
         assert_eq!(name_data.len(), 2);
-        // Both should be null
         assert!(matches!(
             name_data.get_json_value(0),
             Some(serde_json::Value::Null)

@@ -1,5 +1,5 @@
 use serde_json::json;
-use vtf::validation::validate_and_build;
+use vtf::storage::validation::validate_and_build;
 
 #[test]
 fn valid_minimal_table() {

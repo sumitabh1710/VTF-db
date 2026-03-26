@@ -1,20 +1,44 @@
 # VTF — Vector Table Format
 
-A **columnar, typed, JSON-based database engine** written in Rust.
+A **columnar, typed database engine** written in Rust with JSON, binary, and compressed storage formats.
 
-VTF is designed for predictable validation, efficient columnar access, and simple indexing. It stores data in a strict, well-defined JSON format and provides a complete engine for creating, querying, inserting, and indexing structured data.
+VTF is designed for predictable validation, efficient columnar access, advanced querying, and robust persistence. It supports a strict schema, atomic CRUD operations, a write-ahead log, and multiple storage backends.
 
 ## Features
 
+### Core Engine
 - **Strict schema validation** — 7-step pipeline that rejects malformed data immediately
 - **Columnar storage** — data organized by column for efficient scans and filtering
 - **Strong typing** — `int`, `float`, `string`, `boolean`, `date`, `array<T>` with no silent coercion
-- **Atomic operations** — inserts either fully succeed or leave the table untouched
-- **Hash and sorted indexes** — accelerate equality lookups with `O(1)` hash indexes or ordered sorted indexes
-- **Atomic file writes** — write to temp file, fsync, then rename (no partial writes on crash)
+- **Atomic operations** — inserts, deletes, and updates either fully succeed or leave the table untouched
+- **Batch insert** — insert multiple rows atomically with all-or-nothing validation
 - **Schema evolution** — add columns with automatic null backfill
-- **Pretty-print export** — `--pretty` flag for human-readable JSON output
-- **126 tests** — unit tests in every module plus integration test suites
+
+### Query Engine
+- **Query AST** — expression tree supporting `=`, `!=`, `>`, `>=`, `<`, `<=` operators
+- **AND / OR / NOT** — compound boolean expressions with correct precedence
+- **Query parser** — parse human-readable expressions like `age > 25 AND name = 'Alice'`
+- **Query planner** — automatically selects hash index, sorted index range scan, or full column scan
+- **Query executor** — walks the plan, intersects/unions row sets for compound queries
+
+### Indexing
+- **Hash indexes** — `O(1)` equality lookups
+- **Sorted indexes** — ordered keys with range query support (`>`, `<`, `>=`, `<=`)
+- **Automatic index use** — the planner detects available indexes and chooses the best strategy
+
+### Storage
+- **JSON format** — human-readable, with compact and pretty-print modes
+- **Binary format** — column-wise encoding with null bitmaps, 2-5x smaller for string-heavy data
+- **Zstd compression** — compressed binary format for maximum space efficiency
+- **Auto-detection** — `load_auto()` detects format by magic bytes on load
+- **Write-ahead log (WAL)** — append-only `.vtf.wal` file eliminates full file rewrites on every mutation
+- **Auto-compaction** — WAL entries are merged into the base file when threshold is exceeded
+- **Atomic file writes** — write to temp file, fsync, then rename (no partial writes on crash)
+- **File locking** — advisory shared/exclusive locks prevent concurrent write corruption
+
+### Testing & Benchmarks
+- **224+ tests** — unit tests in every module plus comprehensive integration test suites
+- **Criterion benchmarks** — insert, query (scan/index/AST), JSON/binary/compressed encode/decode
 
 ## Supported Types
 
@@ -46,9 +70,14 @@ vtf create users.vtf --columns "id:int,name:string,age:int,active:boolean" --pri
 ### Insert rows
 
 ```bash
+# Single row
 vtf insert users.vtf --row '{"id": 1, "name": "Alice", "age": 30, "active": true}'
-vtf insert users.vtf --row '{"id": 2, "name": "Bob", "age": 25, "active": false}'
-vtf insert users.vtf --row '{"id": 3, "name": "Charlie", "age": 35, "active": true}'
+
+# Batch insert (atomic — all or nothing)
+vtf insert users.vtf --rows '[
+  {"id": 2, "name": "Bob", "age": 25, "active": false},
+  {"id": 3, "name": "Charlie", "age": 35, "active": true}
+]'
 ```
 
 ### Query
@@ -57,28 +86,37 @@ vtf insert users.vtf --row '{"id": 3, "name": "Charlie", "age": 35, "active": tr
 # All rows
 vtf query users.vtf
 
-# Filter by equality
-vtf query users.vtf --where "name=Alice"
+# Simple equality filter
+vtf query users.vtf --where "name = 'Alice'"
+
+# Comparison operators
+vtf query users.vtf --where "age > 25"
+
+# Compound expressions with AND/OR/NOT
+vtf query users.vtf --where "age >= 25 AND active = true"
+vtf query users.vtf --where "(age > 30 OR name = 'Bob') AND active = true"
+vtf query users.vtf --where "NOT active = false"
 
 # Select specific columns
-vtf query users.vtf --where "active=true" --select "name,age"
+vtf query users.vtf --where "age > 25" --select "name,age"
+```
+
+### Update rows
+
+```bash
+vtf update users.vtf --where "name=Bob" --set '{"age": 26, "active": true}'
+```
+
+### Delete rows
+
+```bash
+vtf delete users.vtf --where "active=false"
 ```
 
 ### Table info
 
 ```bash
 vtf info users.vtf
-```
-
-```
-VTF v1.0
-Rows: 3
-
-Columns:
-  id     : int [PK]
-  name   : string
-  age    : int
-  active : boolean
 ```
 
 ### Create an index
@@ -91,17 +129,8 @@ vtf create-index users.vtf --column age --type sorted
 ### Export
 
 ```bash
-# Compact JSON (default)
-vtf export users.vtf
-
-# Pretty-printed JSON
-vtf export users.vtf --pretty
-```
-
-### Validate a file
-
-```bash
-vtf validate users.vtf
+vtf export users.vtf            # Compact JSON
+vtf export users.vtf --pretty   # Pretty-printed JSON
 ```
 
 ### Add a column
@@ -110,69 +139,21 @@ vtf validate users.vtf
 vtf add-column users.vtf --name email --type string
 ```
 
-Existing rows are backfilled with `null`.
-
-## File Format
-
-A `.vtf` file is a JSON document with this structure:
-
-```json
-{
-  "version": "1.0",
-  "columns": [
-    { "name": "id", "type": "int" },
-    { "name": "name", "type": "string" }
-  ],
-  "rowCount": 2,
-  "data": {
-    "id": [1, 2],
-    "name": ["Alice", "Bob"]
-  },
-  "meta": {
-    "primaryKey": "id"
-  },
-  "indexes": {},
-  "extensions": {}
-}
-```
-
-### Validation Rules
-
-1. `version` must be `"1.0"`
-2. `columns` must be a non-empty array with unique names and valid types
-3. `data` keys must exactly match column names (no extra, no missing)
-4. All data arrays must have equal length matching `rowCount`
-5. Every value must match its column's declared type (null is always allowed)
-6. If a primary key is declared, values must be non-null and unique
-7. Index row references must be valid
-
-Validation stops immediately on the first error.
-
 ## Library Usage
-
-VTF is also a Rust library (`use vtf::*`):
 
 ```rust
 use vtf::*;
-use vtf::validation::validate_and_build;
+use vtf::storage::validation::validate_and_build;
 use vtf::storage;
+use vtf::query::{parser, planner};
 use indexmap::IndexMap;
 use serde_json::json;
 
-// Create from JSON
-let raw = json!({
-    "version": "1.0",
-    "columns": [{"name": "id", "type": "int"}],
-    "rowCount": 0,
-    "data": {"id": []},
-    "meta": {"primaryKey": "id"}
-});
-let mut table = validate_and_build(raw).unwrap();
-
-// Or create programmatically
+// Create a table
 let mut table = VtfTable::new(vec![
     Column { name: "id".into(), col_type: ColumnType::Int },
     Column { name: "name".into(), col_type: ColumnType::String },
+    Column { name: "age".into(), col_type: ColumnType::Int },
 ]);
 table.meta.primary_key = Some("id".into());
 
@@ -180,45 +161,83 @@ table.meta.primary_key = Some("id".into());
 let mut row = IndexMap::new();
 row.insert("id".into(), json!(1));
 row.insert("name".into(), json!("Alice"));
+row.insert("age".into(), json!(30));
 table.insert(row).unwrap();
 
-// Query
-let matches = table.filter_eq("name", &json!("Alice")).unwrap();
+// Query with the expression engine
+let expr = parser::parse("age > 25 AND name = 'Alice'").unwrap();
+let plan = table.plan_query(&expr);
+let matches = planner::execute(&table, &plan).unwrap();
 let rows = table.select_rows(&matches, &["id", "name"]).unwrap();
 
-// Index
+// Create indexes for faster queries
 table.create_index("name", IndexType::Hash).unwrap();
+table.create_index("age", IndexType::Sorted).unwrap();
 
-// Schema evolution
-table.add_column("email", ColumnType::String).unwrap();
+// Binary format
+let bytes = vtf::storage::binary::encode(&table).unwrap();
+let decoded = vtf::storage::binary::decode(&bytes).unwrap();
 
-// Save / Load
+// Compressed format
+let compressed = vtf::storage::compression::encode_compressed(&table).unwrap();
+let decoded = vtf::storage::compression::decode_compressed(&compressed).unwrap();
+
+// Save / Load (with advisory file locking)
 storage::save(&table, std::path::Path::new("data.vtf")).unwrap();
 let loaded = storage::load(std::path::Path::new("data.vtf")).unwrap();
-
-// Export
-println!("{}", table.to_pretty_json().unwrap());
 ```
 
 ## Project Structure
 
 ```
 src/
-  lib.rs          Public API re-exports
-  main.rs         CLI binary (clap)
-  model.rs        Core types: VtfTable, Column, ColumnData, IndexDef
-  error.rs        VtfError enum (thiserror)
-  types.rs        Type parsing, date validation, value type checking
-  validation.rs   7-step strict validation pipeline
-  storage.rs      Atomic file I/O + JSON serialization
-  insert.rs       Atomic row insert engine
-  query.rs        Equality filter + column scan + row reconstruction
-  index.rs        Hash index + sorted index
-  schema.rs       Schema evolution (add column)
+  lib.rs                Top-level module declarations + re-exports
+  main.rs               Thin CLI entry point
+
+  core/
+    error.rs            VtfError enum (thiserror)
+    model.rs            VtfTable, Column, ColumnData, IndexDef, Meta
+    types.rs            Type parsing, date validation, value type checking
+
+  storage/
+    validation.rs       7-step strict validation pipeline
+    json.rs             JSON serialization (compact + pretty)
+    io.rs               Atomic file I/O with advisory locking
+    binary.rs           Column-wise binary encoding with null bitmaps
+    compression.rs      Zstd-compressed binary format
+    wal.rs              Write-ahead log (append-only JSON-lines)
+    compaction.rs       WAL-to-base-file merge with auto-trigger
+
+  engine/
+    insert.rs           Atomic single-row and batch insert
+    delete.rs           Row deletion with index rebuild
+    update.rs           Partial row update with PK safety
+    schema.rs           Schema evolution (add column)
+
+  query/
+    ast.rs              Expression AST (Eq, Neq, Gt, Gte, Lt, Lte, And, Or, Not)
+    parser.rs           Recursive-descent query parser
+    filter.rs           Equality filter, column scan, expression evaluation
+    planner.rs          Query planner (index selection) + executor
+
+  index/
+    hash.rs             Hash index construction
+    sorted.rs           Sorted index construction + range queries
+    rebuild.rs          Index create / rebuild / drop on VtfTable
+
+  cli/
+    commands.rs         Clap struct/enum definitions
+    handlers.rs         CLI command handler functions
+
+benches/
+  vtf_bench.rs          Criterion benchmarks (insert, query, encode, decode)
 
 tests/
   validation_tests.rs   30 validation edge cases
   insert_tests.rs       13 insert scenarios
+  batch_insert_tests.rs 11 batch insert tests
+  delete_tests.rs        6 delete integration tests
+  update_tests.rs        8 update integration tests
   query_tests.rs        15 query tests
   storage_tests.rs      12 storage round-trip tests
   edge_cases.rs         11 end-to-end edge cases
@@ -230,14 +249,53 @@ tests/
 cargo test
 ```
 
+## Benchmarks
+
+```bash
+cargo bench
+```
+
+## Architecture
+
+### Module Dependency DAG
+
+```
+core/ ──────┬──> index/ ──┬──> engine/
+            │             ├──> query/
+            ├─────────────┼──> storage/
+            └─────────────┴──> cli/
+```
+
+- **core/** — zero dependencies on other VTF modules (error types, data model, type system)
+- **index/** — depends only on core (hash/sorted index building)
+- **engine/** — depends on core + index (insert, delete, update, schema)
+- **query/** — depends on core + index (filter, AST, parser, planner/executor)
+- **storage/** — depends on core (validation, JSON, binary, WAL, compaction)
+- **cli/** — depends on everything (thin command routing)
+
+### Storage Formats
+
+| Format     | Magic Bytes | Extension | Use Case |
+|------------|-------------|-----------|----------|
+| JSON       | `{`         | `.vtf`    | Human-readable, debugging, interop |
+| Binary     | `VTFb`      | `.vtf`    | Compact storage, fast decode |
+| Compressed | `VTFz`      | `.vtf`    | Maximum space efficiency |
+
+### Write-Ahead Log
+
+Mutations are first appended to a `.vtf.wal` file (JSON-lines format), avoiding full file rewrites. On load, the base file is read and WAL entries are replayed. When the WAL exceeds 100 entries, automatic compaction merges everything into a new base file and deletes the WAL.
+
 ## Design Decisions
 
-- **IndexMap over HashMap** for `data` — preserves column insertion order for deterministic JSON output
-- **Nullable array columns** — `Vec<Option<Vec<Option<T>>>>` supports both null cells and null inner elements
-- **chrono for date validation** — catches invalid dates like Feb 30 that regex alone would miss
-- **tempfile for atomic writes** — creates temp files on the same filesystem to guarantee atomic rename
-- **BTreeMap for sorted indexes** — natural sorted key ordering with efficient range scan potential
-- **Copy-on-write insert atomicity** — new values are built in temporaries, only committed if all columns succeed
+- **IndexMap over HashMap** for `data` — preserves column insertion order for deterministic output
+- **Layered module architecture** — enforces a strict dependency DAG, prevents circular dependencies
+- **Query AST + planner** — separates parsing, planning, and execution for testability and extensibility
+- **WAL before binary format** — eliminates the O(n) rewrite bottleneck before optimizing file size
+- **JSON-lines WAL** — simple, debuggable; binary WAL can be added later
+- **Null bitmaps in binary format** — 1 bit per row per column, compact representation of nullable data
+- **Advisory file locking** — prevents concurrent write corruption without requiring a daemon process
+- **Copy-on-write insert atomicity** — new values built in temporaries, only committed if all columns succeed
+- **Index rebuild after delete/update** — simplest correct approach since row indices shift
 
 ## License
 

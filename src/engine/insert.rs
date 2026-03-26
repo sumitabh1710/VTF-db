@@ -1,23 +1,20 @@
 use indexmap::IndexMap;
 use serde_json::Value;
 
-use crate::error::{VtfError, VtfResult};
-use crate::model::*;
-use crate::types;
+use crate::core::error::{VtfError, VtfResult};
+use crate::core::model::*;
+use crate::core::types;
 
 impl VtfTable {
     /// Insert a row atomically. Either all columns are updated, or none.
     pub fn insert(&mut self, row: IndexMap<String, Value>) -> VtfResult<()> {
-        // Step 1: Validate keys — must match columns exactly
         self.validate_insert_keys(&row)?;
 
-        // Step 2: Validate types for each value
         for col in &self.columns {
             let val = &row[&col.name];
             types::validate_value(val, &col.col_type, &col.name, self.row_count)?;
         }
 
-        // Step 3: Check primary key uniqueness
         if let Some(ref pk) = self.meta.primary_key {
             let pk_val = &row[pk];
             if pk_val.is_null() {
@@ -28,7 +25,6 @@ impl VtfTable {
             self.check_pk_uniqueness(pk, pk_val)?;
         }
 
-        // Step 4: Build new values in temporaries (copy-on-write for atomicity)
         let new_row_idx = self.row_count;
         let mut appended_values: Vec<(String, AppendValue)> = Vec::with_capacity(self.columns.len());
 
@@ -38,7 +34,6 @@ impl VtfTable {
             appended_values.push((col.name.clone(), append_val));
         }
 
-        // Step 5: Commit — append all values (this cannot fail if validation passed)
         for (col_name, append_val) in &appended_values {
             let col_data = self.data.get_mut(col_name).unwrap();
             append_to_column(col_data, append_val);
@@ -46,7 +41,6 @@ impl VtfTable {
 
         self.row_count += 1;
 
-        // Step 6: Update indexes
         for (col_name, idx) in self.indexes.iter_mut() {
             let col_data = &self.data[col_name];
             if let Some(key) = col_data.value_as_key(new_row_idx) {
@@ -87,7 +81,6 @@ impl VtfTable {
     fn check_pk_uniqueness(&self, pk: &str, new_val: &Value) -> VtfResult<()> {
         let col_data = &self.data[pk];
 
-        // Use index if available for O(1) check
         if let Some(idx) = self.indexes.get(pk) {
             let key = value_to_key(new_val);
             if idx.map.contains_key(&key) {
@@ -99,7 +92,6 @@ impl VtfTable {
             return Ok(());
         }
 
-        // Fall back to linear scan
         for i in 0..self.row_count {
             let existing = col_data.get_json_value(i).unwrap_or(Value::Null);
             if !existing.is_null() && values_equal(&existing, new_val) {
@@ -110,6 +102,90 @@ impl VtfTable {
             }
         }
         Ok(())
+    }
+
+    /// Insert multiple rows atomically. Either ALL rows are inserted, or NONE.
+    pub fn insert_batch(
+        &mut self,
+        rows: Vec<IndexMap<String, Value>>,
+    ) -> VtfResult<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let pk = self.meta.primary_key.clone();
+
+        let mut all_appended: Vec<Vec<(String, AppendValue)>> = Vec::with_capacity(rows.len());
+        let mut batch_pk_values: Vec<String> = Vec::new();
+
+        for (batch_idx, row) in rows.iter().enumerate() {
+            self.validate_insert_keys(row)?;
+
+            for col in &self.columns {
+                let val = &row[&col.name];
+                types::validate_value(val, &col.col_type, &col.name, self.row_count + batch_idx)?;
+            }
+
+            if let Some(ref pk_col) = pk {
+                let pk_val = &row[pk_col];
+                if pk_val.is_null() {
+                    return Err(VtfError::insert(format!(
+                        "primary key column '{pk_col}' cannot be null (batch row {batch_idx})"
+                    )));
+                }
+                self.check_pk_uniqueness(pk_col, pk_val)?;
+
+                let key = value_to_key(pk_val);
+                if batch_pk_values.contains(&key) {
+                    return Err(VtfError::PrimaryKeyViolation {
+                        column: pk_col.clone(),
+                        value: key,
+                    });
+                }
+                batch_pk_values.push(key);
+            }
+
+            let mut row_values = Vec::with_capacity(self.columns.len());
+            for col in &self.columns {
+                let val = &row[&col.name];
+                let append_val = parse_value_for_append(val, &col.col_type)?;
+                row_values.push((col.name.clone(), append_val));
+            }
+            all_appended.push(row_values);
+        }
+
+        let start_idx = self.row_count;
+        let count = all_appended.len();
+
+        for row_values in &all_appended {
+            for (col_name, append_val) in row_values {
+                let col_data = self.data.get_mut(col_name).unwrap();
+                append_to_column(col_data, append_val);
+            }
+        }
+
+        self.row_count += count;
+
+        for new_row_offset in 0..count {
+            let new_row_idx = start_idx + new_row_offset;
+            for (col_name, idx) in self.indexes.iter_mut() {
+                let col_data = &self.data[col_name];
+                if let Some(key) = col_data.value_as_key(new_row_idx) {
+                    idx.map
+                        .entry(key.clone())
+                        .or_insert_with(Vec::new)
+                        .push(new_row_idx);
+
+                    if let Some(ref mut sorted_keys) = idx.sorted_keys {
+                        if let Err(pos) = sorted_keys.binary_search(&key) {
+                            sorted_keys.insert(pos, key);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(count)
     }
 }
 
@@ -210,7 +286,6 @@ fn value_to_key(val: &Value) -> String {
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(an), Value::Number(bn)) => {
-            // Compare as i64 if both are integers, otherwise as f64
             if let (Some(ai), Some(bi)) = (an.as_i64(), bn.as_i64()) {
                 ai == bi
             } else {
@@ -224,7 +299,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Column, ColumnType};
+    use crate::core::model::{Column, ColumnType};
 
     fn test_table() -> VtfTable {
         let columns = vec![

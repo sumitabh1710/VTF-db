@@ -3,12 +3,12 @@ use std::collections::HashSet;
 use indexmap::IndexMap;
 use serde_json::Value;
 
-use crate::error::{VtfError, VtfResult};
-use crate::model::*;
-use crate::types;
+use crate::core::error::{VtfError, VtfResult};
+use crate::core::model::*;
+use crate::core::types;
 
 /// Parse and validate a raw JSON value into a fully validated VtfTable.
-/// Validation runs in strict order — stops immediately on first failure.
+/// Validation runs in strict order -- stops immediately on first failure.
 ///
 /// Steps: version -> columns -> data keys -> column lengths -> types -> primary key -> indexes
 pub fn validate_and_build(raw: Value) -> VtfResult<VtfTable> {
@@ -16,34 +16,16 @@ pub fn validate_and_build(raw: Value) -> VtfResult<VtfTable> {
         .as_object()
         .ok_or_else(|| VtfError::validation("top-level value must be a JSON object"))?;
 
-    // Step 1: Version
     let version = validate_version(obj)?;
-
-    // Step 2: Columns
     let columns = validate_columns(obj)?;
-
-    // Step 3: RowCount
     let row_count = validate_row_count(obj)?;
-
-    // Step 4: Data keys match columns
     let raw_data = validate_data_keys(obj, &columns)?;
-
-    // Step 5: Column lengths must equal rowCount
     validate_column_lengths(&raw_data, &columns, row_count)?;
-
-    // Step 6: Type checking — every value matches declared type
     validate_types(&raw_data, &columns)?;
-
-    // Build typed column data
     let data = build_column_data(&raw_data, &columns)?;
-
-    // Step 7: Meta / Primary key
     let meta = validate_meta(obj, &columns, &data, row_count)?;
-
-    // Step 8: Indexes
     let indexes = validate_indexes(obj, &columns, &data, row_count)?;
 
-    // Extensions (optional, pass through)
     let extensions = obj
         .get("extensions")
         .cloned()
@@ -336,7 +318,6 @@ fn validate_primary_key_values(pk: &str, data: &ColumnData) -> VtfResult<()> {
         let key = data.value_as_key(i);
         match key {
             Some(ref k) if k == "null" => {
-                // Check if the actual value is null
                 let json_val = data.get_json_value(i).unwrap();
                 if json_val.is_null() {
                     return Err(VtfError::validation(format!(

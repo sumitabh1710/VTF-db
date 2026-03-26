@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use serde_json::json;
 use vtf::storage;
-use vtf::validation::validate_and_build;
+use vtf::storage::validation::validate_and_build;
 use vtf::*;
 
 fn make_table() -> VtfTable {
