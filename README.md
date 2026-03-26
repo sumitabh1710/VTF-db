@@ -1,8 +1,88 @@
 # VTF — Vector Table Format
 
-A **columnar, typed database engine** written in Rust with JSON, binary, and compressed storage formats.
+A **columnar, typed database engine** written in Rust. No server, no daemon — just a single file and a strict schema.
 
-VTF is designed for predictable validation, efficient columnar access, advanced querying, and robust persistence. It supports a strict schema, atomic CRUD operations, a write-ahead log, and multiple storage backends.
+## What is VTF?
+
+Most databases store data **row by row** (PostgreSQL, MySQL) or as **free-form documents** (MongoDB). VTF takes a different approach: it stores data **column by column** as typed vectors — hence the name *Vector Table Format*.
+
+Every column in a VTF table is a contiguous, homogeneously-typed array. A column of integers is literally a `Vec<Option<i64>>` in memory. A column of strings is a `Vec<Option<String>>`. There is no row object, no BSON document, no tuple — just parallel vectors that share the same length.
+
+The file *is* the database. There is no server process to start, no connection string to configure, no authentication layer to set up. You create a `.vtf` file, read and write to it directly, and that's it. Think SQLite in spirit, but columnar by design.
+
+### The key ideas
+
+- **Columnar layout** — scanning an entire column (e.g. "give me every `age` value") reads one contiguous array, not every row in the table
+- **Strict schema** — every write is validated against a 7-step pipeline. No field can be the wrong type, no row can be missing a column, no primary key can be duplicated. The database rejects bad data instead of silently storing it
+- **Multiple storage formats** — the same table can be stored as human-readable JSON (for debugging), compact binary (for size), or zstd-compressed binary (for maximum efficiency)
+- **Atomic mutations** — every insert, update, delete, and batch operation either fully succeeds or leaves the table completely untouched. No partial writes, ever
+- **Embedded, zero-dependency runtime** — a single Rust binary with no background processes, no config files, no network ports
+
+## How Data is Stored
+
+Consider a simple `users` table with three rows. Here is how different systems represent it:
+
+**SQL databases (row-oriented)** — data is stored one row at a time:
+
+```
+Row 1: { id: 1, name: "Alice",   age: 30 }
+Row 2: { id: 2, name: "Bob",     age: 25 }
+Row 3: { id: 3, name: "Charlie", age: 35 }
+```
+
+To compute the average age, the engine must visit every row and skip past `id` and `name` to reach `age`.
+
+**MongoDB (document-oriented)** — data is stored as independent documents:
+
+```
+{ _id: ObjectId(...), id: 1, name: "Alice",   age: 30 }
+{ _id: ObjectId(...), id: 2, name: "Bob",     age: 25 }
+{ _id: ObjectId(...), id: 3, name: "Charlie", age: 35 }
+```
+
+Each document can have different fields. Flexible, but there is no guarantee that every document has an `age` field or that `age` is always an integer.
+
+**VTF (column-oriented)** — data is stored as typed vectors, one per column:
+
+```
+id:   [1,       2,     3        ]   ← Vec<Option<i64>>
+name: ["Alice", "Bob", "Charlie"]   ← Vec<Option<String>>
+age:  [30,      25,    35       ]   ← Vec<Option<i64>>
+```
+
+To compute the average age, VTF reads the `age` vector directly — no row scanning, no field skipping. The schema guarantees every value is an `i64` or null. Nothing else can exist there.
+
+## Why VTF?
+
+VTF is not trying to replace PostgreSQL or MongoDB for production web applications. It is a different tool for a different set of problems.
+
+|                    | SQL (Postgres, MySQL)          | MongoDB                         | VTF                                     |
+|--------------------|--------------------------------|---------------------------------|-----------------------------------------|
+| **Architecture**   | Client-server (daemon required)| Client-server (mongod required) | Embedded, single file, no server        |
+| **Data model**     | Row-oriented tables            | Schemaless BSON documents       | Columnar typed vectors                  |
+| **Schema**         | Enforced via DDL               | Optional (schemaless by default)| Strictly enforced on every write        |
+| **Column scans**   | Requires full table scan or index | Requires collection scan or index | Native — data is already columnar    |
+| **File format**    | Opaque binary (WAL + pages)    | Opaque binary (WiredTiger)      | Inspectable JSON, compact binary, or compressed |
+| **Setup**          | Install, configure, start daemon | Install, configure, start mongod | `cargo build` — done                  |
+| **Best for**       | General-purpose OLTP           | Flexible document storage       | Typed datasets, column analytics, embedded use |
+
+### Where VTF shines
+
+- **Typed dataset storage** where schema correctness matters more than flexibility
+- **Analytics-style queries** that scan or filter entire columns (e.g. "all users where age > 25")
+- **Embedded use in Rust applications** — link it as a library, no IPC or network overhead
+- **Inspectable persistence** — open the `.vtf` file in any text editor (JSON mode) and see exactly what is stored
+- **Learning how databases work** — VTF implements a real query planner, WAL, binary encoding, and compression in a small, readable codebase
+
+### How it works under the hood
+
+**Write path:** A mutation (insert, update, delete) is first appended to a Write-Ahead Log (`.vtf.wal` file) as a single JSON line. The base file is not touched. When the WAL exceeds 100 entries, automatic compaction replays all entries into a fresh base file and deletes the WAL.
+
+**Read path:** On load, VTF reads the base file (auto-detecting JSON, binary, or compressed format by magic bytes), then replays any pending WAL entries to reconstruct the current state.
+
+**Query path:** A query string like `age > 25 AND active = true` is parsed into an expression tree (AST), fed to a planner that checks which indexes are available, and executed — using hash index lookups for equality, sorted index range scans for comparisons, or full column scans as a fallback.
+
+---
 
 ## Features
 
