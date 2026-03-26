@@ -1,5 +1,5 @@
-use crate::error::{VtfError, VtfResult};
-use crate::model::ColumnType;
+use crate::core::error::{VtfError, VtfResult};
+use crate::core::model::ColumnType;
 use chrono::DateTime;
 
 impl ColumnType {
@@ -50,8 +50,6 @@ pub fn validate_date(s: &str) -> VtfResult<()> {
     Ok(())
 }
 
-/// Validate that a JSON value matches the expected column type.
-/// Returns Ok(()) if the value is null (null is allowed in all columns).
 pub fn validate_value(
     value: &serde_json::Value,
     col_type: &ColumnType,

@@ -1,12 +1,9 @@
-pub mod error;
-pub mod model;
-pub mod types;
-pub mod validation;
+pub mod core;
 pub mod storage;
-pub mod insert;
+pub mod engine;
 pub mod query;
 pub mod index;
-pub mod schema;
+pub mod cli;
 
-pub use error::{VtfError, VtfResult};
-pub use model::{Column, ColumnData, ColumnType, IndexDef, IndexType, Meta, VtfTable};
+pub use core::error::{VtfError, VtfResult};
+pub use core::model::{Column, ColumnData, ColumnType, IndexDef, IndexType, Meta, VtfTable};

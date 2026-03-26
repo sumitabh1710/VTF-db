@@ -1,50 +1,14 @@
-use std::fs;
-use std::io::Write;
-use std::path::Path;
-
 use serde_json::Value;
-use tempfile::NamedTempFile;
 
-use crate::error::{VtfError, VtfResult};
-use crate::model::*;
-use crate::validation;
-
-/// Load a VTF file from disk: read -> parse JSON -> validate -> return VtfTable.
-pub fn load(path: &Path) -> VtfResult<VtfTable> {
-    let contents = fs::read_to_string(path)?;
-    let raw: Value = serde_json::from_str(&contents)?;
-    validation::validate_and_build(raw)
-}
-
-/// Save a VtfTable to disk atomically: serialize -> write temp file -> fsync -> rename.
-pub fn save(table: &VtfTable, path: &Path) -> VtfResult<()> {
-    let json = table.to_json()?;
-    atomic_write(path, json.as_bytes())
-}
-
-/// Atomic write: write to temp file in the same directory, fsync, then rename.
-fn atomic_write(path: &Path, data: &[u8]) -> VtfResult<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = NamedTempFile::new_in(dir)?;
-    tmp.write_all(data)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| {
-        VtfError::Storage(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to persist temp file: {e}"),
-        ))
-    })?;
-    Ok(())
-}
+use crate::core::model::*;
+use crate::core::error::VtfResult;
 
 impl VtfTable {
-    /// Serialize to compact JSON (default for storage).
     pub fn to_json(&self) -> VtfResult<String> {
         let val = self.to_json_value();
         Ok(serde_json::to_string(&val)?)
     }
 
-    /// Serialize to pretty-printed JSON (for debugging/export).
     pub fn to_pretty_json(&self) -> VtfResult<String> {
         let val = self.to_json_value();
         Ok(serde_json::to_string_pretty(&val)?)
@@ -135,7 +99,8 @@ impl VtfTable {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::core::model::*;
+    use crate::storage::validation;
 
     fn sample_table() -> VtfTable {
         let columns = vec![
@@ -167,7 +132,7 @@ mod tests {
     fn test_roundtrip() {
         let table = sample_table();
         let json = table.to_json().unwrap();
-        let raw: Value = serde_json::from_str(&json).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
         let loaded = validation::validate_and_build(raw).unwrap();
         assert_eq!(loaded.row_count, 2);
         assert_eq!(loaded.columns.len(), 2);
@@ -180,16 +145,5 @@ mod tests {
         let pretty = table.to_pretty_json().unwrap();
         assert!(pretty.contains('\n'));
         assert!(pretty.contains("  "));
-    }
-
-    #[test]
-    fn test_save_load_file() {
-        let table = sample_table();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.vtf");
-        save(&table, &path).unwrap();
-        let loaded = load(&path).unwrap();
-        assert_eq!(loaded.row_count, 2);
-        assert_eq!(loaded.meta.primary_key, Some("id".to_string()));
     }
 }

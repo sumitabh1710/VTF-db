@@ -84,7 +84,6 @@ impl ColumnData {
         }
     }
 
-    /// Get the value at a given row index as a serde_json::Value.
     pub fn get_json_value(&self, idx: usize) -> Option<serde_json::Value> {
         if idx >= self.len() {
             return None;
@@ -146,7 +145,68 @@ impl ColumnData {
         })
     }
 
-    /// Get the string representation of a value at a row index (for index keys).
+    pub fn remove(&mut self, idx: usize) {
+        match self {
+            ColumnData::Int(v) => { v.remove(idx); }
+            ColumnData::Float(v) => { v.remove(idx); }
+            ColumnData::Str(v) => { v.remove(idx); }
+            ColumnData::Bool(v) => { v.remove(idx); }
+            ColumnData::Date(v) => { v.remove(idx); }
+            ColumnData::ArrayInt(v) => { v.remove(idx); }
+            ColumnData::ArrayFloat(v) => { v.remove(idx); }
+            ColumnData::ArrayStr(v) => { v.remove(idx); }
+        }
+    }
+
+    pub fn set(&mut self, idx: usize, val: &serde_json::Value) {
+        match self {
+            ColumnData::Int(v) => {
+                v[idx] = if val.is_null() { None }
+                else { Some(val.as_i64().or_else(|| val.as_u64().map(|u| u as i64)).unwrap()) };
+            }
+            ColumnData::Float(v) => {
+                v[idx] = if val.is_null() { None } else { val.as_f64() };
+            }
+            ColumnData::Str(v) => {
+                v[idx] = val.as_str().map(|s| s.to_string());
+            }
+            ColumnData::Bool(v) => {
+                v[idx] = if val.is_null() { None } else { val.as_bool() };
+            }
+            ColumnData::Date(v) => {
+                v[idx] = val.as_str().map(|s| s.to_string());
+            }
+            ColumnData::ArrayInt(v) => {
+                v[idx] = if val.is_null() {
+                    None
+                } else {
+                    Some(val.as_array().unwrap().iter().map(|elem| {
+                        if elem.is_null() { None }
+                        else { Some(elem.as_i64().or_else(|| elem.as_u64().map(|u| u as i64)).unwrap()) }
+                    }).collect())
+                };
+            }
+            ColumnData::ArrayFloat(v) => {
+                v[idx] = if val.is_null() {
+                    None
+                } else {
+                    Some(val.as_array().unwrap().iter().map(|elem| {
+                        if elem.is_null() { None } else { elem.as_f64() }
+                    }).collect())
+                };
+            }
+            ColumnData::ArrayStr(v) => {
+                v[idx] = if val.is_null() {
+                    None
+                } else {
+                    Some(val.as_array().unwrap().iter().map(|elem| {
+                        elem.as_str().map(|s| s.to_string())
+                    }).collect())
+                };
+            }
+        }
+    }
+
     pub fn value_as_key(&self, idx: usize) -> Option<std::string::String> {
         if idx >= self.len() {
             return None;
