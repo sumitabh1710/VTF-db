@@ -167,30 +167,30 @@ vtf insert users.vtf --rows '[
 vtf query users.vtf
 
 # Simple equality filter
-vtf query users.vtf --where "name = 'Alice'"
+vtf query users.vtf --filter "name = 'Alice'"
 
 # Comparison operators
-vtf query users.vtf --where "age > 25"
+vtf query users.vtf --filter "age > 25"
 
 # Compound expressions with AND/OR/NOT
-vtf query users.vtf --where "age >= 25 AND active = true"
-vtf query users.vtf --where "(age > 30 OR name = 'Bob') AND active = true"
-vtf query users.vtf --where "NOT active = false"
+vtf query users.vtf --filter "age >= 25 AND active = true"
+vtf query users.vtf --filter "(age > 30 OR name = 'Bob') AND active = true"
+vtf query users.vtf --filter "NOT active = false"
 
 # Select specific columns
-vtf query users.vtf --where "age > 25" --select "name,age"
+vtf query users.vtf --filter "age > 25" --select "name,age"
 ```
 
 ### Update rows
 
 ```bash
-vtf update users.vtf --where "name=Bob" --set '{"age": 26, "active": true}'
+vtf update users.vtf --filter "name=Bob" --set '{"age": 26, "active": true}'
 ```
 
 ### Delete rows
 
 ```bash
-vtf delete users.vtf --where "active=false"
+vtf delete users.vtf --filter "active=false"
 ```
 
 ### Table info
@@ -202,8 +202,8 @@ vtf info users.vtf
 ### Create an index
 
 ```bash
-vtf create-index users.vtf --column name --type hash
-vtf create-index users.vtf --column age --type sorted
+vtf create-index users.vtf --column name --index-type hash
+vtf create-index users.vtf --column age --index-type sorted
 ```
 
 ### Export
@@ -216,7 +216,7 @@ vtf export users.vtf --pretty   # Pretty-printed JSON
 ### Add a column
 
 ```bash
-vtf add-column users.vtf --name email --type string
+vtf add-column users.vtf --name email --col-type string
 ```
 
 ## Library Usage

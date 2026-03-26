@@ -4,3 +4,7 @@ Cargo.lock
 *.swo
 *~
 .DS_Store
+
+# Keep docs local by default; only README is tracked
+*.md
+!README.md
