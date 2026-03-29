@@ -66,19 +66,42 @@ pub enum Commands {
         /// Columns to select (comma-separated)
         #[arg(long)]
         select: Option<String>,
+        /// Maximum number of rows to return
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Show table info (schema, row count, indexes)
     Info {
         /// VTF file path
         file: PathBuf,
     },
-    /// Export table as JSON
+    /// Export table in JSON, binary, or compressed format
     Export {
         /// VTF file path
         file: PathBuf,
         /// Pretty-print the JSON output
         #[arg(long)]
         pretty: bool,
+        /// Output format: json (default), binary, compressed
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Output file path (required for binary/compressed, optional for json)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Run aggregation functions on a column
+    Aggregate {
+        /// VTF file path
+        file: PathBuf,
+        /// Column to aggregate
+        #[arg(long)]
+        column: String,
+        /// Functions to run (comma-separated): count, sum, avg, min, max
+        #[arg(long)]
+        function: String,
+        /// Optional filter expression
+        #[arg(long, name = "where")]
+        filter: Option<String>,
     },
     /// Add a column to an existing table
     AddColumn {
@@ -90,6 +113,34 @@ pub enum Commands {
         /// Column type (int, float, string, boolean, date, array<int>, array<float>, array<string>)
         #[arg(long, name = "type")]
         col_type: String,
+    },
+    /// Vector similarity search on an array<float> column
+    Search {
+        /// VTF file path
+        file: PathBuf,
+        /// Column containing embeddings (must be array<float>)
+        #[arg(long)]
+        column: String,
+        /// Query vector as JSON array: "[0.12, -0.98, 0.44]"
+        #[arg(long)]
+        vector: String,
+        /// Number of top results to return
+        #[arg(long, default_value = "5")]
+        top_k: usize,
+        /// Similarity metric: "cosine" or "euclidean"
+        #[arg(long, default_value = "cosine")]
+        metric: String,
+        /// Columns to display in results (comma-separated)
+        #[arg(long)]
+        select: Option<String>,
+    },
+    /// Drop an index from a column
+    DropIndex {
+        /// VTF file path
+        file: PathBuf,
+        /// Column to drop the index from
+        #[arg(long)]
+        column: String,
     },
     /// Create an index on a column
     CreateIndex {

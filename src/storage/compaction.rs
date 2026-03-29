@@ -22,13 +22,21 @@ pub fn compact(vtf_path: &Path) -> VtfResult<VtfTable> {
 }
 
 /// Load a table with WAL replay. If the WAL has entries, replay them
-/// onto the base table. Optionally trigger compaction if threshold exceeded.
+/// onto the base table. Logs replay timing to stderr.
 pub fn load_with_wal(vtf_path: &Path) -> VtfResult<VtfTable> {
     let mut table = io::load(vtf_path)?;
     let entries = wal::read_entries(vtf_path)?;
 
     if !entries.is_empty() {
+        let count = entries.len();
+        let start = std::time::Instant::now();
         wal::replay(&mut table, &entries)?;
+        let elapsed = start.elapsed();
+        eprintln!(
+            "[WAL] Replayed {} entries in {:.1}ms",
+            count,
+            elapsed.as_secs_f64() * 1000.0
+        );
     }
 
     Ok(table)
