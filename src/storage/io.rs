@@ -72,6 +72,11 @@ pub fn load_auto(path: &Path) -> VtfResult<VtfTable> {
     }
 }
 
+/// Atomic write available for external callers (e.g. compressed export).
+pub fn atomic_write_public(path: &Path, data: &[u8]) -> VtfResult<()> {
+    atomic_write(path, data)
+}
+
 fn atomic_write(path: &Path, data: &[u8]) -> VtfResult<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = NamedTempFile::new_in(dir)?;

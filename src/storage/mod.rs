@@ -7,3 +7,4 @@ pub mod validation;
 pub mod wal;
 
 pub use io::{load, save};
+pub use compaction::{load_with_wal, save_with_wal};

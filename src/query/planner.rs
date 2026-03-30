@@ -1,6 +1,35 @@
+use std::collections::HashSet;
+
 use crate::core::error::VtfResult;
 use crate::core::model::*;
 use crate::query::ast::Expr;
+
+/// Walk an expression tree and collect all column names it references.
+pub fn required_columns(expr: &Expr) -> HashSet<String> {
+    let mut cols = HashSet::new();
+    collect_columns(expr, &mut cols);
+    cols
+}
+
+fn collect_columns(expr: &Expr, cols: &mut HashSet<String>) {
+    match expr {
+        Expr::Eq { column, .. }
+        | Expr::Neq { column, .. }
+        | Expr::Gt { column, .. }
+        | Expr::Gte { column, .. }
+        | Expr::Lt { column, .. }
+        | Expr::Lte { column, .. } => {
+            cols.insert(column.clone());
+        }
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            collect_columns(l, cols);
+            collect_columns(r, cols);
+        }
+        Expr::Not(inner) => {
+            collect_columns(inner, cols);
+        }
+    }
+}
 
 /// A physical execution plan produced by the planner.
 #[derive(Debug, Clone)]
@@ -296,5 +325,26 @@ mod tests {
         // age <= 30: Alice(30), Bob(25), Dave(28), Eve(22) -> {0,1,3,4}
         // Intersect: {0,3}
         assert_eq!(result, vec![0, 3]);
+    }
+
+    #[test]
+    fn required_columns_extracts_all_referenced() {
+        let expr = crate::query::parser::parse("age > 25 AND name = 'Alice' OR active = true").unwrap();
+        let cols = required_columns(&expr);
+        assert!(cols.contains("age"));
+        assert!(cols.contains("name"));
+        assert!(cols.contains("active"));
+        assert_eq!(cols.len(), 3);
+    }
+
+    #[test]
+    fn required_columns_with_not() {
+        let expr = Expr::Not(Box::new(Expr::Eq {
+            column: "status".to_string(),
+            value: json!("deleted"),
+        }));
+        let cols = required_columns(&expr);
+        assert_eq!(cols.len(), 1);
+        assert!(cols.contains("status"));
     }
 }

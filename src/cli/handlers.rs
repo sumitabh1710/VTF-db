@@ -1,14 +1,43 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use indexmap::IndexMap;
 
 use crate::core::error::VtfError;
 use crate::core::model::*;
 use crate::storage;
+use crate::storage::wal::WalEntry;
 use crate::query::parser as query_parser;
 use crate::cli::commands::Commands;
 
 pub fn run(command: Commands) -> Result<(), VtfError> {
+    let start = Instant::now();
+    let label = command_label(&command);
+    let result = run_inner(command);
+    let elapsed = start.elapsed();
+    eprintln!("[{label}] {:.1}ms", elapsed.as_secs_f64() * 1000.0);
+    result
+}
+
+fn command_label(cmd: &Commands) -> &'static str {
+    match cmd {
+        Commands::Create { .. } => "CREATE",
+        Commands::Validate { .. } => "VALIDATE",
+        Commands::Insert { .. } => "INSERT",
+        Commands::Delete { .. } => "DELETE",
+        Commands::Update { .. } => "UPDATE",
+        Commands::Query { .. } => "QUERY",
+        Commands::Info { .. } => "INFO",
+        Commands::Export { .. } => "EXPORT",
+        Commands::Search { .. } => "SEARCH",
+        Commands::Aggregate { .. } => "AGGREGATE",
+        Commands::DropIndex { .. } => "DROP-INDEX",
+        Commands::AddColumn { .. } => "ADD-COLUMN",
+        Commands::CreateIndex { .. } => "CREATE-INDEX",
+    }
+}
+
+fn run_inner(command: Commands) -> Result<(), VtfError> {
     match command {
         Commands::Create {
             file,
@@ -28,11 +57,32 @@ pub fn run(command: Commands) -> Result<(), VtfError> {
             file,
             filter,
             select,
-        } => cmd_query(&file, filter.as_deref(), select.as_deref()),
+            limit,
+        } => cmd_query(&file, filter.as_deref(), select.as_deref(), limit),
 
         Commands::Info { file } => cmd_info(&file),
 
-        Commands::Export { file, pretty } => cmd_export(&file, pretty),
+        Commands::Export { file, pretty, format, output } => {
+            cmd_export(&file, pretty, &format, output.as_deref())
+        }
+
+        Commands::Aggregate {
+            file,
+            column,
+            function,
+            filter,
+        } => cmd_aggregate(&file, &column, &function, filter.as_deref()),
+
+        Commands::DropIndex { file, column } => cmd_drop_index(&file, &column),
+
+        Commands::Search {
+            file,
+            column,
+            vector,
+            top_k,
+            metric,
+            select,
+        } => cmd_search(&file, &column, &vector, top_k, &metric, select.as_deref()),
 
         Commands::AddColumn {
             file,
@@ -65,13 +115,14 @@ fn cmd_create(
         table.meta.primary_key = Some(pk.to_string());
     }
 
+    // Create writes the initial base file directly (no WAL for new files)
     storage::save(&table, file)?;
     println!("Created {}", file.display());
     Ok(())
 }
 
 fn cmd_validate(file: &PathBuf) -> Result<(), VtfError> {
-    storage::load(file)?;
+    storage::load_with_wal(file)?;
     println!("Valid VTF file: {}", file.display());
     Ok(())
 }
@@ -81,7 +132,7 @@ fn cmd_insert(
     row_json: Option<&str>,
     rows_json: Option<&str>,
 ) -> Result<(), VtfError> {
-    let mut table = storage::load(file)?;
+    let mut table = storage::load_with_wal(file)?;
 
     if let Some(rows_str) = rows_json {
         let val: serde_json::Value = serde_json::from_str(rows_str)
@@ -101,8 +152,9 @@ fn cmd_insert(
             })
             .collect::<Result<Vec<_>, VtfError>>()?;
 
+        let wal_entry = WalEntry::InsertBatch { rows: rows.clone() };
         let count = table.insert_batch(rows)?;
-        storage::save(&table, file)?;
+        storage::save_with_wal(file, &wal_entry)?;
         println!("Inserted {count} rows (rowCount: {})", table.row_count);
     } else if let Some(row_str) = row_json {
         let val: serde_json::Value = serde_json::from_str(row_str)
@@ -114,8 +166,9 @@ fn cmd_insert(
         let row: IndexMap<String, serde_json::Value> =
             obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
+        let wal_entry = WalEntry::Insert { row: row.clone() };
         table.insert(row)?;
-        storage::save(&table, file)?;
+        storage::save_with_wal(file, &wal_entry)?;
         println!("Inserted row (rowCount: {})", table.row_count);
     } else {
         return Err(VtfError::insert("either --row or --rows must be provided"));
@@ -125,7 +178,7 @@ fn cmd_insert(
 }
 
 fn cmd_delete(file: &PathBuf, filter_str: &str) -> Result<(), VtfError> {
-    let mut table = storage::load(file)?;
+    let mut table = storage::load_with_wal(file)?;
     let (col, val) = parse_filter(filter_str)?;
     let indices = table.filter_eq(&col, &val)?;
 
@@ -134,14 +187,15 @@ fn cmd_delete(file: &PathBuf, filter_str: &str) -> Result<(), VtfError> {
         return Ok(());
     }
 
+    let wal_entry = WalEntry::Delete { indices: indices.clone() };
     let count = table.delete(&indices)?;
-    storage::save(&table, file)?;
+    storage::save_with_wal(file, &wal_entry)?;
     println!("Deleted {count} rows (rowCount: {})", table.row_count);
     Ok(())
 }
 
 fn cmd_update(file: &PathBuf, filter_str: &str, set_json: &str) -> Result<(), VtfError> {
-    let mut table = storage::load(file)?;
+    let mut table = storage::load_with_wal(file)?;
     let (col, val) = parse_filter(filter_str)?;
     let indices = table.filter_eq(&col, &val)?;
 
@@ -161,8 +215,12 @@ fn cmd_update(file: &PathBuf, filter_str: &str, set_json: &str) -> Result<(), Vt
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
+    let wal_entry = WalEntry::Update {
+        indices: indices.clone(),
+        values: values.clone(),
+    };
     let count = table.update(&indices, values)?;
-    storage::save(&table, file)?;
+    storage::save_with_wal(file, &wal_entry)?;
     println!("Updated {count} rows");
     Ok(())
 }
@@ -171,10 +229,11 @@ fn cmd_query(
     file: &PathBuf,
     filter: Option<&str>,
     select: Option<&str>,
+    limit: Option<usize>,
 ) -> Result<(), VtfError> {
-    let table = storage::load(file)?;
+    let table = storage::load_with_wal(file)?;
 
-    let indices = if let Some(filter_str) = filter {
+    let mut indices = if let Some(filter_str) = filter {
         if let Ok(expr) = query_parser::parse(filter_str) {
             let plan = table.plan_query(&expr);
             crate::query::planner::execute(&table, &plan)?
@@ -185,6 +244,10 @@ fn cmd_query(
     } else {
         (0..table.row_count).collect()
     };
+
+    if let Some(n) = limit {
+        indices.truncate(n);
+    }
 
     let cols: Vec<&str> = match select {
         Some(s) => s.split(',').map(|c| c.trim()).collect(),
@@ -203,7 +266,7 @@ fn cmd_query(
 }
 
 fn cmd_info(file: &PathBuf) -> Result<(), VtfError> {
-    let table = storage::load(file)?;
+    let table = storage::load_with_wal(file)?;
 
     println!("VTF v{}", table.version);
     println!("Rows: {}", table.row_count);
@@ -233,28 +296,236 @@ fn cmd_info(file: &PathBuf) -> Result<(), VtfError> {
     Ok(())
 }
 
-fn cmd_export(file: &PathBuf, pretty: bool) -> Result<(), VtfError> {
-    let table = storage::load(file)?;
-    let json = if pretty {
-        table.to_pretty_json()?
+fn cmd_export(
+    file: &PathBuf,
+    pretty: bool,
+    format: &str,
+    output: Option<&std::path::Path>,
+) -> Result<(), VtfError> {
+    let table = storage::load_with_wal(file)?;
+
+    match format {
+        "json" => {
+            let json = if pretty {
+                table.to_pretty_json()?
+            } else {
+                table.to_json()?
+            };
+            if let Some(out_path) = output {
+                std::fs::write(out_path, &json)?;
+                println!("Exported JSON to {}", out_path.display());
+            } else {
+                println!("{json}");
+            }
+        }
+        "binary" => {
+            let out = output.ok_or_else(|| {
+                VtfError::validation("--output is required for binary format")
+            })?;
+            storage::io::save_binary(&table, out)?;
+            println!("Exported binary to {}", out.display());
+        }
+        "compressed" => {
+            let out = output.ok_or_else(|| {
+                VtfError::validation("--output is required for compressed format")
+            })?;
+            let bytes = crate::storage::compression::encode_compressed(&table)?;
+            storage::io::atomic_write_public(out, &bytes)?;
+            println!("Exported compressed to {}", out.display());
+        }
+        other => {
+            return Err(VtfError::validation(format!(
+                "unknown format: '{other}' (expected 'json', 'binary', or 'compressed')"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn cmd_aggregate(
+    file: &PathBuf,
+    column: &str,
+    functions_str: &str,
+    filter: Option<&str>,
+) -> Result<(), VtfError> {
+    use crate::query::aggregate;
+
+    let table = storage::load_with_wal(file)?;
+
+    let col_data = table.data.get(column).ok_or_else(|| {
+        VtfError::query(format!("column '{column}' not found"))
+    })?;
+
+    let indices: Option<Vec<usize>> = if let Some(filter_str) = filter {
+        let idx = if let Ok(expr) = query_parser::parse(filter_str) {
+            let plan = table.plan_query(&expr);
+            crate::query::planner::execute(&table, &plan)?
+        } else {
+            let (col, val) = parse_filter(filter_str)?;
+            table.filter_eq(&col, &val)?
+        };
+        Some(idx)
     } else {
-        table.to_json()?
+        None
     };
-    println!("{json}");
+
+    let idx_slice = indices.as_deref();
+
+    for func_name in functions_str.split(',').map(|s| s.trim()) {
+        match func_name {
+            "count" => {
+                let v = aggregate::count(col_data, idx_slice);
+                println!("count({column}) = {v}");
+            }
+            "sum" => {
+                let v = aggregate::sum(col_data, idx_slice)?;
+                println!("sum({column}) = {v}");
+            }
+            "avg" => {
+                let v = aggregate::avg(col_data, idx_slice)?;
+                println!("avg({column}) = {v}");
+            }
+            "min" => {
+                let v = aggregate::min_val(col_data, idx_slice)?;
+                println!("min({column}) = {}", format_value(&v));
+            }
+            "max" => {
+                let v = aggregate::max_val(col_data, idx_slice)?;
+                println!("max({column}) = {}", format_value(&v));
+            }
+            other => {
+                return Err(VtfError::query(format!(
+                    "unknown function: '{other}' (expected count, sum, avg, min, max)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_drop_index(file: &PathBuf, column: &str) -> Result<(), VtfError> {
+    let mut table = storage::load_with_wal(file)?;
+    table.drop_index(column)?;
+    storage::save(&table, file)?;
+    println!("Dropped index on column '{column}'");
+    Ok(())
+}
+
+fn cmd_search(
+    file: &PathBuf,
+    column: &str,
+    vector_json: &str,
+    k: usize,
+    metric_str: &str,
+    select: Option<&str>,
+) -> Result<(), VtfError> {
+    use crate::query::vector::{self, Metric};
+
+    let table = storage::load_with_wal(file)?;
+
+    let vec_val: serde_json::Value = serde_json::from_str(vector_json)
+        .map_err(|e| VtfError::query(format!("invalid vector JSON: {e}")))?;
+    let arr = vec_val
+        .as_array()
+        .ok_or_else(|| VtfError::query("--vector must be a JSON array"))?;
+    let query_vec: Vec<f64> = arr
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            v.as_f64()
+                .ok_or_else(|| VtfError::query(format!("vector[{i}] is not a number")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let metric = match metric_str {
+        "cosine" => Metric::Cosine,
+        "euclidean" => Metric::Euclidean,
+        other => {
+            return Err(VtfError::query(format!(
+                "unknown metric: '{other}' (expected 'cosine' or 'euclidean')"
+            )));
+        }
+    };
+
+    let results = vector::top_k(&table, column, &query_vec, k, metric)?;
+
+    if results.is_empty() {
+        println!("No matching vectors.");
+        return Ok(());
+    }
+
+    let cols: Vec<&str> = match select {
+        Some(s) => s.split(',').map(|c| c.trim()).collect(),
+        None => Vec::new(),
+    };
+
+    let score_label = match metric {
+        Metric::Cosine => "similarity",
+        Metric::Euclidean => "distance",
+    };
+
+    let indices: Vec<usize> = results.iter().map(|(idx, _)| *idx).collect();
+    let rows = table.select_rows(&indices, &cols)?;
+
+    let col_names: Vec<&str> = if cols.is_empty() {
+        table.columns.iter().map(|c| c.name.as_str()).collect()
+    } else {
+        cols.clone()
+    };
+
+    let mut widths: Vec<usize> = col_names.iter().map(|n| n.len()).collect();
+    widths.push(score_label.len().max(10));
+
+    for row in &rows {
+        for (i, col) in col_names.iter().enumerate() {
+            let val_str = format_value(row.get(*col).unwrap_or(&serde_json::Value::Null));
+            widths[i] = widths[i].max(val_str.len());
+        }
+    }
+
+    let mut header: Vec<String> = col_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("{:width$}", n, width = widths[i]))
+        .collect();
+    header.push(format!("{:width$}", score_label, width = *widths.last().unwrap()));
+    println!("{}", header.join(" | "));
+
+    let separator: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+    println!("{}", separator.join("-+-"));
+
+    for (row_idx, (_, score)) in rows.iter().zip(results.iter()) {
+        let mut vals: Vec<String> = col_names
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                let val = row_idx.get(*col).unwrap_or(&serde_json::Value::Null);
+                format!("{:width$}", format_value(val), width = widths[i])
+            })
+            .collect();
+        vals.push(format!("{:>width$.6}", score, width = *widths.last().unwrap()));
+        println!("{}", vals.join(" | "));
+    }
+
+    println!("\n({} results)", results.len());
     Ok(())
 }
 
 fn cmd_add_column(file: &PathBuf, name: &str, col_type_str: &str) -> Result<(), VtfError> {
-    let mut table = storage::load(file)?;
+    let mut table = storage::load_with_wal(file)?;
     let col_type = ColumnType::from_str(col_type_str)?;
+    let wal_entry = WalEntry::AddColumn {
+        name: name.to_string(),
+        col_type: col_type_str.to_string(),
+    };
     table.add_column(name, col_type)?;
-    storage::save(&table, file)?;
+    storage::save_with_wal(file, &wal_entry)?;
     println!("Added column '{name}' ({col_type_str})");
     Ok(())
 }
 
 fn cmd_create_index(file: &PathBuf, column: &str, index_type_str: &str) -> Result<(), VtfError> {
-    let mut table = storage::load(file)?;
+    let mut table = storage::load_with_wal(file)?;
     let idx_type = match index_type_str {
         "hash" => IndexType::Hash,
         "sorted" => IndexType::Sorted,
@@ -264,8 +535,12 @@ fn cmd_create_index(file: &PathBuf, column: &str, index_type_str: &str) -> Resul
             )))
         }
     };
+    let wal_entry = WalEntry::CreateIndex {
+        column: column.to_string(),
+        index_type: index_type_str.to_string(),
+    };
     table.create_index(column, idx_type)?;
-    storage::save(&table, file)?;
+    storage::save_with_wal(file, &wal_entry)?;
     println!("Created {index_type_str} index on column '{column}'");
     Ok(())
 }

@@ -30,6 +30,11 @@ pub enum WalEntry {
         name: String,
         col_type: String,
     },
+    #[serde(rename = "create_index")]
+    CreateIndex {
+        column: String,
+        index_type: String,
+    },
 }
 
 /// Get the WAL file path for a given VTF file.
@@ -40,20 +45,23 @@ pub fn wal_path(vtf_path: &Path) -> PathBuf {
     p
 }
 
-/// Append a WAL entry to the log file.
+/// Append a WAL entry to the log file with a CRC32 checksum.
+/// Format: `<entry_json>\t<crc32_hex>`
 pub fn append(vtf_path: &Path, entry: &WalEntry) -> VtfResult<()> {
     let path = wal_path(vtf_path);
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
-    let line = serde_json::to_string(entry)?;
-    writeln!(file, "{}", line)?;
+    let json = serde_json::to_string(entry)?;
+    let checksum = crc32fast::hash(json.as_bytes());
+    writeln!(file, "{}\t{:08x}", json, checksum)?;
     file.sync_all()?;
     Ok(())
 }
 
-/// Read all WAL entries from the log file.
+/// Read all WAL entries from the log file, validating CRC32 checksums.
+/// Corrupt or unparseable entries are skipped with a warning to stderr.
 pub fn read_entries(vtf_path: &Path) -> VtfResult<Vec<WalEntry>> {
     let path = wal_path(vtf_path);
     if !path.exists() {
@@ -62,18 +70,55 @@ pub fn read_entries(vtf_path: &Path) -> VtfResult<Vec<WalEntry>> {
     let file = fs::File::open(&path)?;
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
-    for line in reader.lines() {
+    for (line_num, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let entry: WalEntry = serde_json::from_str(&line).map_err(|e| {
-            VtfError::Storage(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("corrupt WAL entry: {e}"),
-            ))
-        })?;
-        entries.push(entry);
+
+        if let Some((json_part, checksum_hex)) = line.rsplit_once('\t') {
+            if let Ok(expected) = u32::from_str_radix(checksum_hex, 16) {
+                let actual = crc32fast::hash(json_part.as_bytes());
+                if actual != expected {
+                    eprintln!(
+                        "[WAL] Warning: corrupt entry at line {} (checksum mismatch), skipping",
+                        line_num + 1
+                    );
+                    continue;
+                }
+                match serde_json::from_str::<WalEntry>(json_part) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => {
+                        eprintln!(
+                            "[WAL] Warning: corrupt entry at line {} ({e}), skipping",
+                            line_num + 1
+                        );
+                    }
+                }
+            } else {
+                // Tab found but checksum not valid hex — try whole line as legacy
+                match serde_json::from_str::<WalEntry>(&line) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => {
+                        eprintln!(
+                            "[WAL] Warning: corrupt entry at line {} ({e}), skipping",
+                            line_num + 1
+                        );
+                    }
+                }
+            }
+        } else {
+            // No tab — legacy format without checksum
+            match serde_json::from_str::<WalEntry>(&line) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => {
+                    eprintln!(
+                        "[WAL] Warning: corrupt entry at line {} ({e}), skipping",
+                        line_num + 1
+                    );
+                }
+            }
+        }
     }
     Ok(entries)
 }
@@ -97,6 +142,18 @@ pub fn replay(table: &mut VtfTable, entries: &[WalEntry]) -> VtfResult<()> {
             WalEntry::AddColumn { name, col_type } => {
                 let ct = ColumnType::from_str(col_type)?;
                 table.add_column(name, ct)?;
+            }
+            WalEntry::CreateIndex { column, index_type } => {
+                let idx_type = match index_type.as_str() {
+                    "hash" => IndexType::Hash,
+                    "sorted" => IndexType::Sorted,
+                    other => {
+                        return Err(VtfError::validation(format!(
+                            "unknown index type in WAL: '{other}'"
+                        )));
+                    }
+                };
+                table.create_index(column, idx_type)?;
             }
         }
     }
@@ -147,6 +204,60 @@ mod tests {
 
         let entries = read_entries(&vtf).unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn corrupt_entry_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let vtf = dir.path().join("test.vtf");
+
+        let mut row = IndexMap::new();
+        row.insert("id".to_string(), json!(1));
+        append(&vtf, &WalEntry::Insert { row }).unwrap();
+
+        // Append a corrupt line (bad checksum)
+        let wal = wal_path(&vtf);
+        let mut f = OpenOptions::new().append(true).open(&wal).unwrap();
+        writeln!(f, "{{\"op\":\"insert\",\"row\":{{\"id\":2}}}}\tdeadbeef").unwrap();
+
+        // Append another valid entry
+        let mut row2 = IndexMap::new();
+        row2.insert("id".to_string(), json!(3));
+        append(&vtf, &WalEntry::Insert { row: row2 }).unwrap();
+
+        let entries = read_entries(&vtf).unwrap();
+        assert_eq!(entries.len(), 2); // corrupt middle entry skipped
+    }
+
+    #[test]
+    fn totally_garbage_line_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let vtf = dir.path().join("test.vtf");
+
+        let mut row = IndexMap::new();
+        row.insert("id".to_string(), json!(1));
+        append(&vtf, &WalEntry::Insert { row }).unwrap();
+
+        let wal = wal_path(&vtf);
+        let mut f = OpenOptions::new().append(true).open(&wal).unwrap();
+        writeln!(f, "this is total garbage").unwrap();
+
+        let entries = read_entries(&vtf).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn legacy_format_without_checksum_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let vtf = dir.path().join("test.vtf");
+        let wal = wal_path(&vtf);
+
+        // Write legacy format (no tab/checksum)
+        let mut f = OpenOptions::new().create(true).write(true).open(&wal).unwrap();
+        writeln!(f, "{{\"op\":\"insert\",\"row\":{{\"id\":1}}}}").unwrap();
+
+        let entries = read_entries(&vtf).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]
@@ -272,6 +383,33 @@ mod tests {
         replay(&mut table, &entries).unwrap();
         assert_eq!(table.columns.len(), 2);
         assert_eq!(table.data["name"].len(), 1);
+    }
+
+    #[test]
+    fn replay_create_index() {
+        let columns = vec![
+            Column { name: "id".to_string(), col_type: ColumnType::Int },
+            Column { name: "name".to_string(), col_type: ColumnType::String },
+        ];
+        let mut table = VtfTable::new(columns);
+
+        let entries = vec![
+            WalEntry::Insert {
+                row: {
+                    let mut r = IndexMap::new();
+                    r.insert("id".to_string(), json!(1));
+                    r.insert("name".to_string(), json!("Alice"));
+                    r
+                },
+            },
+            WalEntry::CreateIndex {
+                column: "name".to_string(),
+                index_type: "hash".to_string(),
+            },
+        ];
+
+        replay(&mut table, &entries).unwrap();
+        assert!(table.indexes.contains_key("name"));
     }
 
     #[test]

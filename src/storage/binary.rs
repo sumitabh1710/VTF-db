@@ -58,6 +58,69 @@ pub fn encode(table: &VtfTable) -> VtfResult<Vec<u8>> {
     Ok(buf)
 }
 
+/// Decode only the specified columns from binary data, skipping the rest.
+/// Columns not in `needed` are represented as empty vectors in the returned table.
+/// This avoids allocating/parsing data for columns the query doesn't need.
+pub fn decode_partial(data: &[u8], needed: &std::collections::HashSet<String>) -> VtfResult<VtfTable> {
+    let mut cursor = Cursor::new(data);
+
+    let mut magic = [0u8; 4];
+    cursor.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        return Err(VtfError::validation("invalid binary magic bytes"));
+    }
+
+    let mut version = [0u8; 1];
+    cursor.read_exact(&mut version)?;
+    if version[0] != FORMAT_VERSION {
+        return Err(VtfError::validation(format!(
+            "unsupported binary format version: {}",
+            version[0]
+        )));
+    }
+
+    let col_count = read_u32(&mut cursor)? as usize;
+    let row_count = read_u32(&mut cursor)? as usize;
+
+    let mut columns = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        let name = read_string(&mut cursor)?;
+        let mut type_byte = [0u8; 1];
+        cursor.read_exact(&mut type_byte)?;
+        let col_type = byte_to_column_type(type_byte[0])?;
+        columns.push(Column { name, col_type });
+    }
+
+    let mut has_pk = [0u8; 1];
+    cursor.read_exact(&mut has_pk)?;
+    let primary_key = if has_pk[0] == 1 {
+        Some(read_string(&mut cursor)?)
+    } else {
+        None
+    };
+
+    let mut col_data_map = IndexMap::new();
+    for col in &columns {
+        if needed.contains(&col.name) {
+            let col_data = decode_column(&mut cursor, &col.col_type, row_count)?;
+            col_data_map.insert(col.name.clone(), col_data);
+        } else {
+            skip_column(&mut cursor, &col.col_type, row_count)?;
+            col_data_map.insert(col.name.clone(), ColumnData::empty_for_type(&col.col_type));
+        }
+    }
+
+    Ok(VtfTable {
+        version: "1.0".to_string(),
+        columns,
+        row_count,
+        data: col_data_map,
+        meta: Meta { primary_key },
+        indexes: IndexMap::new(),
+        extensions: serde_json::Value::Object(serde_json::Map::new()),
+    })
+}
+
 /// Decode binary bytes into a VtfTable.
 pub fn decode(data: &[u8]) -> VtfResult<VtfTable> {
     let mut cursor = Cursor::new(data);
@@ -287,6 +350,55 @@ fn encode_column(buf: &mut Vec<u8>, data: &ColumnData, row_count: usize) -> VtfR
                     }
                     None => {
                         buf.write_all(&0u32.to_le_bytes())?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Advance the cursor past one column's data without allocating structures.
+fn skip_column(cursor: &mut Cursor<&[u8]>, col_type: &ColumnType, row_count: usize) -> VtfResult<()> {
+    let nulls = decode_null_bitmap(cursor, row_count)?;
+
+    match col_type {
+        ColumnType::Int | ColumnType::Float => {
+            let mut skip = vec![0u8; row_count * 8];
+            cursor.read_exact(&mut skip)?;
+        }
+        ColumnType::String | ColumnType::Date => {
+            for _ in 0..row_count {
+                let len = read_u16(cursor)? as usize;
+                let mut skip = vec![0u8; len];
+                cursor.read_exact(&mut skip)?;
+            }
+        }
+        ColumnType::Boolean => {
+            let mut skip = vec![0u8; (row_count + 7) / 8];
+            cursor.read_exact(&mut skip)?;
+        }
+        ColumnType::ArrayInt | ColumnType::ArrayFloat => {
+            for i in 0..row_count {
+                let len = read_u32(cursor)? as usize;
+                if !nulls[i] && len > 0 {
+                    let inner_bmp = (len + 7) / 8;
+                    let mut skip = vec![0u8; inner_bmp + len * 8];
+                    cursor.read_exact(&mut skip)?;
+                }
+            }
+        }
+        ColumnType::ArrayString => {
+            for i in 0..row_count {
+                let len = read_u32(cursor)? as usize;
+                if !nulls[i] && len > 0 {
+                    let inner_bmp = (len + 7) / 8;
+                    let mut skip = vec![0u8; inner_bmp];
+                    cursor.read_exact(&mut skip)?;
+                    for _ in 0..len {
+                        let slen = read_u16(cursor)? as usize;
+                        let mut skip = vec![0u8; slen];
+                        cursor.read_exact(&mut skip)?;
                     }
                 }
             }
@@ -568,6 +680,41 @@ mod tests {
     fn decode_rejects_bad_magic() {
         let bad = b"BADM\x01";
         assert!(decode(bad).is_err());
+    }
+
+    #[test]
+    fn decode_partial_only_loads_requested_columns() {
+        let j = json!({
+            "version": "1.0",
+            "columns": [
+                {"name": "id", "type": "int"},
+                {"name": "name", "type": "string"},
+                {"name": "age", "type": "int"}
+            ],
+            "rowCount": 3,
+            "data": {
+                "id": [1, 2, 3],
+                "name": ["Alice", "Bob", "Charlie"],
+                "age": [30, 25, 35]
+            },
+            "meta": {"primaryKey": "id"}
+        });
+        let table = validation::validate_and_build(j).unwrap();
+        let bytes = encode(&table).unwrap();
+
+        let mut needed = std::collections::HashSet::new();
+        needed.insert("age".to_string());
+
+        let partial = decode_partial(&bytes, &needed).unwrap();
+        assert_eq!(partial.row_count, 3);
+        assert_eq!(partial.columns.len(), 3);
+
+        // Requested column has data
+        assert_eq!(partial.data["age"].len(), 3);
+
+        // Skipped columns have empty vectors
+        assert_eq!(partial.data["id"].len(), 0);
+        assert_eq!(partial.data["name"].len(), 0);
     }
 
     #[test]
