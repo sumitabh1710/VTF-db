@@ -31,6 +31,11 @@ pub fn validate_and_build(raw: Value) -> VtfResult<VtfTable> {
         .cloned()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
+    let lsn = obj
+        .get("lsn")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
     Ok(VtfTable {
         version,
         columns,
@@ -39,6 +44,7 @@ pub fn validate_and_build(raw: Value) -> VtfResult<VtfTable> {
         meta,
         indexes,
         extensions,
+        lsn,
     })
 }
 
@@ -277,11 +283,16 @@ fn validate_meta(
     obj: &serde_json::Map<String, Value>,
     columns: &[Column],
     data: &IndexMap<String, ColumnData>,
-    _row_count: usize,
+    row_count: usize,
 ) -> VtfResult<Meta> {
     let meta_val = match obj.get("meta") {
         Some(v) => v,
-        None => return Ok(Meta { primary_key: None }),
+        None => return Ok(Meta {
+            primary_key: None,
+            unique_columns: Vec::new(),
+            not_null_columns: Vec::new(),
+            defaults: IndexMap::new(),
+        }),
     };
 
     let meta_obj = meta_val
@@ -308,7 +319,96 @@ fn validate_meta(
         None => None,
     };
 
-    Ok(Meta { primary_key })
+    // Parse uniqueColumns
+    let unique_columns = match meta_obj.get("uniqueColumns") {
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| VtfError::validation("'meta.uniqueColumns' must be an array"))?;
+            let mut cols = Vec::new();
+            for item in arr {
+                let name = item.as_str().ok_or_else(|| VtfError::validation("'meta.uniqueColumns' entries must be strings"))?;
+                if !columns.iter().any(|c| c.name == name) {
+                    return Err(VtfError::validation(format!("unique constraint references unknown column '{name}'")));
+                }
+                cols.push(name.to_string());
+            }
+            // Validate existing data has no duplicates for these columns
+            for col_name in &cols {
+                let col_data = &data[col_name];
+                validate_unique_values(col_name, col_data, row_count)?;
+            }
+            cols
+        }
+        None => Vec::new(),
+    };
+
+    // Parse notNullColumns
+    let not_null_columns = match meta_obj.get("notNullColumns") {
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| VtfError::validation("'meta.notNullColumns' must be an array"))?;
+            let mut cols = Vec::new();
+            for item in arr {
+                let name = item.as_str().ok_or_else(|| VtfError::validation("'meta.notNullColumns' entries must be strings"))?;
+                if !columns.iter().any(|c| c.name == name) {
+                    return Err(VtfError::validation(format!("not-null constraint references unknown column '{name}'")));
+                }
+                cols.push(name.to_string());
+            }
+            // Validate existing data has no nulls for these columns
+            for col_name in &cols {
+                let col_data = &data[col_name];
+                validate_not_null_values(col_name, col_data, row_count)?;
+            }
+            cols
+        }
+        None => Vec::new(),
+    };
+
+    // Parse defaults
+    let defaults = match meta_obj.get("defaults") {
+        Some(v) => {
+            let obj = v.as_object().ok_or_else(|| VtfError::validation("'meta.defaults' must be an object"))?;
+            let mut map = IndexMap::new();
+            for (col_name, default_val) in obj {
+                if !columns.iter().any(|c| c.name == *col_name) {
+                    return Err(VtfError::validation(format!("default references unknown column '{col_name}'")));
+                }
+                map.insert(col_name.clone(), default_val.clone());
+            }
+            map
+        }
+        None => IndexMap::new(),
+    };
+
+    Ok(Meta { primary_key, unique_columns, not_null_columns, defaults })
+}
+
+fn validate_unique_values(col_name: &str, data: &ColumnData, row_count: usize) -> VtfResult<()> {
+    let mut seen = HashSet::new();
+    for i in 0..row_count {
+        if let Some(key) = data.value_as_key(i) {
+            let json_val = data.get_json_value(i).unwrap_or(Value::Null);
+            if json_val.is_null() {
+                continue; // nulls are exempt from unique checks
+            }
+            if !seen.insert(key.clone()) {
+                return Err(VtfError::UniqueViolation {
+                    column: col_name.to_string(),
+                    value: key,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_not_null_values(col_name: &str, data: &ColumnData, row_count: usize) -> VtfResult<()> {
+    for i in 0..row_count {
+        let val = data.get_json_value(i).unwrap_or(Value::Null);
+        if val.is_null() {
+            return Err(VtfError::NotNullViolation { column: col_name.to_string() });
+        }
+    }
+    Ok(())
 }
 
 fn validate_primary_key_values(pk: &str, data: &ColumnData) -> VtfResult<()> {

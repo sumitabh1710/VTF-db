@@ -115,9 +115,15 @@ pub fn decode_partial(data: &[u8], needed: &std::collections::HashSet<String>) -
         columns,
         row_count,
         data: col_data_map,
-        meta: Meta { primary_key },
+        meta: Meta {
+            primary_key,
+            unique_columns: Vec::new(),
+            not_null_columns: Vec::new(),
+            defaults: IndexMap::new(),
+        },
         indexes: IndexMap::new(),
         extensions: serde_json::Value::Object(serde_json::Map::new()),
+        lsn: 0,
     })
 }
 
@@ -171,9 +177,15 @@ pub fn decode(data: &[u8]) -> VtfResult<VtfTable> {
         columns,
         row_count,
         data: col_data_map,
-        meta: Meta { primary_key },
+        meta: Meta {
+            primary_key,
+            unique_columns: Vec::new(),
+            not_null_columns: Vec::new(),
+            defaults: IndexMap::new(),
+        },
         indexes: IndexMap::new(),
         extensions: serde_json::Value::Object(serde_json::Map::new()),
+        lsn: 0,
     })
 }
 

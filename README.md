@@ -1,477 +1,512 @@
 # VTF — Vector Table Format
 
-A **columnar, typed database engine** written in Rust. No server, no daemon — just a single file and a strict schema.
-
-## What is VTF?
-
-Most databases store data **row by row** (PostgreSQL, MySQL) or as **free-form documents** (MongoDB). VTF takes a different approach: it stores data **column by column** as typed vectors — hence the name *Vector Table Format*.
-
-Every column in a VTF table is a contiguous, homogeneously-typed array. A column of integers is literally a `Vec<Option<i64>>` in memory. A column of strings is a `Vec<Option<String>>`. There is no row object, no BSON document, no tuple — just parallel vectors that share the same length.
-
-The file *is* the database. There is no server process to start, no connection string to configure, no authentication layer to set up. You create a `.vtf` file, read and write to it directly, and that's it. Think SQLite in spirit, but columnar by design.
-
-### The key ideas
-
-- **Columnar layout** — scanning an entire column (e.g. "give me every `age` value") reads one contiguous array, not every row in the table
-- **Strict schema** — every write is validated against a 7-step pipeline. No field can be the wrong type, no row can be missing a column, no primary key can be duplicated. The database rejects bad data instead of silently storing it
-- **Crash-safe writes** — all mutations go through a Write-Ahead Log with CRC32 checksums. If the process crashes mid-write, the data is recovered on next load. Corrupt WAL entries are detected and skipped automatically
-- **Vector similarity search** — store embeddings as `array<float>` columns and run brute-force cosine/euclidean top-K searches for AI and semantic retrieval use cases
-- **Multiple storage formats** — the same table can be stored as human-readable JSON (for debugging), compact binary (for size), or zstd-compressed binary (for maximum efficiency)
-- **Embedded, zero-dependency runtime** — a single Rust binary with no background processes, no config files, no network ports
-
-## How Data is Stored
-
-Consider a simple `users` table with three rows. Here is how different systems represent it:
-
-**SQL databases (row-oriented)** — data is stored one row at a time:
-
-```
-Row 1: { id: 1, name: "Alice",   age: 30 }
-Row 2: { id: 2, name: "Bob",     age: 25 }
-Row 3: { id: 3, name: "Charlie", age: 35 }
-```
-
-To compute the average age, the engine must visit every row and skip past `id` and `name` to reach `age`.
-
-**MongoDB (document-oriented)** — data is stored as independent documents:
-
-```
-{ _id: ObjectId(...), id: 1, name: "Alice",   age: 30 }
-{ _id: ObjectId(...), id: 2, name: "Bob",     age: 25 }
-{ _id: ObjectId(...), id: 3, name: "Charlie", age: 35 }
-```
-
-Each document can have different fields. Flexible, but there is no guarantee that every document has an `age` field or that `age` is always an integer.
-
-**VTF (column-oriented)** — data is stored as typed vectors, one per column:
-
-```
-id:   [1,       2,     3        ]   ← Vec<Option<i64>>
-name: ["Alice", "Bob", "Charlie"]   ← Vec<Option<String>>
-age:  [30,      25,    35       ]   ← Vec<Option<i64>>
-```
-
-To compute the average age, VTF reads the `age` vector directly — no row scanning, no field skipping. The schema guarantees every value is an `i64` or null. Nothing else can exist there.
-
-## Why VTF?
-
-VTF is not trying to replace PostgreSQL or MongoDB for production web applications. It is a different tool for a different set of problems.
-
-|                    | SQL (Postgres, MySQL)          | MongoDB                         | VTF                                     |
-|--------------------|--------------------------------|---------------------------------|-----------------------------------------|
-| **Architecture**   | Client-server (daemon required)| Client-server (mongod required) | Embedded, single file, no server        |
-| **Data model**     | Row-oriented tables            | Schemaless BSON documents       | Columnar typed vectors                  |
-| **Schema**         | Enforced via DDL               | Optional (schemaless by default)| Strictly enforced on every write        |
-| **Column scans**   | Requires full table scan or index | Requires collection scan or index | Native — data is already columnar    |
-| **Crash safety**   | WAL + fsync (mature)           | Journaling (WiredTiger)         | WAL with CRC32 checksums + auto-compaction |
-| **Vector search**  | pgvector extension             | Atlas Vector Search (cloud)     | Built-in brute-force cosine/euclidean   |
-| **Aggregations**   | Full SQL (GROUP BY, HAVING)    | Aggregation pipeline            | COUNT, SUM, AVG, MIN, MAX with optional filter |
-| **File format**    | Opaque binary (WAL + pages)    | Opaque binary (WiredTiger)      | Inspectable JSON, compact binary, or compressed |
-| **Setup**          | Install, configure, start daemon | Install, configure, start mongod | `cargo build` — done                  |
-| **Best for**       | General-purpose OLTP           | Flexible document storage       | Typed datasets, column analytics, embedded AI |
-
-### Where VTF shines
-
-- **Typed dataset storage** where schema correctness matters more than flexibility
-- **Analytics-style queries** that scan or filter entire columns (e.g. "all users where age > 25")
-- **AI / semantic search** — store embeddings alongside structured data and run similarity queries without a separate vector database
-- **Aggregations on columnar data** — COUNT, SUM, AVG, MIN, MAX operate directly on column vectors without row reconstruction
-- **Embedded use in Rust applications** — link it as a library, no IPC or network overhead
-- **Inspectable persistence** — open the `.vtf` file in any text editor (JSON mode) and see exactly what is stored
-- **Learning how databases work** — VTF implements a real query planner, WAL with checksums, binary encoding, vector search, and compression in a small, readable codebase
-
-### How it works under the hood
-
-**Write path:** A mutation (insert, update, delete) is validated in memory, then appended to a Write-Ahead Log (`.vtf.wal` file) as a single JSON line with a CRC32 checksum. The base file is not touched. When the WAL exceeds 100 entries, automatic compaction replays all entries into a fresh base file and deletes the WAL.
-
-**Read path:** On load, VTF reads the base file (auto-detecting JSON, binary, or compressed format by magic bytes), then replays any pending WAL entries to reconstruct the current state. Corrupt WAL entries (checksum mismatch) are skipped with a warning — only clean entries are replayed.
-
-**Query path:** A query string like `age > 25 AND active = true` is parsed into an expression tree (AST), fed to a planner that checks which indexes are available, and executed — using hash index lookups for equality, sorted index range scans for comparisons, or full column scans as a fallback. Results can be limited with `--limit`.
-
-**Vector search path:** A similarity query takes an `array<float>` column and a query vector, computes cosine similarity or euclidean distance for every row (brute-force), and returns the top-K closest matches with scores.
-
-**Aggregation path:** Functions like AVG, SUM, COUNT operate directly on the raw column vector — the columnar layout means no row reconstruction is needed. An optional `--where` filter narrows the aggregation to matching rows.
-
-**Observability:** Every CLI command logs its execution time to stderr (e.g. `[QUERY] 1.2ms`, `[INSERT] 0.4ms`). WAL replay logs entry count and duration on startup.
+A columnar, typed, embedded database built in Rust.  
+VTF stores data column-by-column (not row-by-row), uses a Write-Ahead Log for crash safety, supports vector similarity search, multi-operation transactions, and schema constraints — all from a single binary with zero runtime dependencies.
 
 ---
 
-## Features
+## Why VTF?
 
-### Core Engine
-- **Strict schema validation** — 7-step pipeline that rejects malformed data immediately
-- **Columnar storage** — data organized by column for efficient scans and filtering
-- **Strong typing** — `int`, `float`, `string`, `boolean`, `date`, `array<T>` with no silent coercion
-- **Atomic operations** — inserts, deletes, and updates either fully succeed or leave the table untouched
-- **Batch insert** — insert multiple rows atomically with all-or-nothing validation
-- **Schema evolution** — add columns with automatic null backfill
+Most databases store rows as packed blobs. When you query `SELECT avg(salary) FROM employees`, a row-oriented database touches every byte of every row — even columns you don't care about.
 
-### Query Engine
-- **Query AST** — expression tree supporting `=`, `!=`, `>`, `>=`, `<`, `<=` operators
-- **AND / OR / NOT** — compound boolean expressions with correct precedence
-- **Query parser** — parse human-readable expressions like `age > 25 AND name = 'Alice'`
-- **Query planner** — automatically selects hash index, sorted index range scan, or full column scan
-- **Query executor** — walks the plan, intersects/unions row sets for compound queries
-- **LIMIT** — cap result count with `--limit`
+VTF stores each column as a contiguous typed array:
 
-### Vector Search
-- **Cosine similarity** — `dot(a,b) / (||a|| * ||b||)` for semantic similarity
-- **Euclidean distance** — `sqrt(sum((a_i - b_i)^2))` for spatial proximity
-- **Brute-force top-K** — scans `array<float>` column, returns top-K results with scores
-- **Null-safe** — skips null rows and dimension-mismatched vectors
-- **CLI `search` command** — specify column, query vector, k, metric, and output columns
-
-### Aggregation Functions
-- **COUNT** — non-null count
-- **SUM / AVG** — numeric columns (int/float)
-- **MIN / MAX** — numeric, string, and date columns
-- **Filtered aggregation** — combine with `--where` to aggregate only matching rows
-- **True columnar advantage** — operates directly on `ColumnData` vectors, no row reconstruction
-
-### Indexing
-- **Hash indexes** — `O(1)` equality lookups
-- **Sorted indexes** — ordered keys with range query support (`>`, `<`, `>=`, `<=`)
-- **Automatic index use** — the planner detects available indexes and chooses the best strategy
-- **Drop index** — remove an index when no longer needed
-
-### Storage
-- **JSON format** — human-readable, with compact and pretty-print modes
-- **Binary format** — column-wise encoding with null bitmaps, 2-5x smaller for string-heavy data
-- **Zstd compression** — compressed binary format for maximum space efficiency
-- **Projection pushdown** — binary format supports selective column decoding (skip unneeded columns)
-- **Auto-detection** — detects format by magic bytes on load
-- **Write-ahead log (WAL)** — all mutations go through WAL with CRC32 checksums for crash safety
-- **Corrupt entry recovery** — bad WAL entries are detected by checksum and skipped with a warning
-- **Auto-compaction** — WAL entries are merged into the base file when threshold is exceeded
-- **Atomic file writes** — write to temp file, fsync, then rename (no partial writes on crash)
-- **File locking** — advisory shared/exclusive locks prevent concurrent write corruption
-- **Multi-format export** — export to JSON, binary, or compressed format via `--format` flag
-
-### Observability
-- **Timing on every command** — `[QUERY] 1.2ms`, `[INSERT] 0.4ms`, `[SEARCH] 2.1ms` logged to stderr
-- **WAL replay logging** — `[WAL] Replayed 42 entries in 8ms` on startup when entries exist
-
-### Testing & Benchmarks
-- **259+ tests** — unit tests in every module plus comprehensive integration test suites
-- **Criterion benchmarks** — insert, query (scan/index/AST), JSON/binary/compressed encode/decode
-
-## Supported Types
-
-| Type             | Rust Mapping                       | Nullable |
-|------------------|------------------------------------|----------|
-| `int`            | `i64`                              | Yes      |
-| `float`          | `f64`                              | Yes      |
-| `string`         | `String`                           | Yes      |
-| `boolean`        | `bool`                             | Yes      |
-| `date`           | `String` (UTC, `YYYY-MM-DDTHH:mm:ssZ`) | Yes |
-| `array<int>`     | `Vec<Option<i64>>`                 | Yes      |
-| `array<float>`   | `Vec<Option<f64>>`                 | Yes      |
-| `array<string>`  | `Vec<Option<String>>`              | Yes      |
-
-## Quick Start
-
-### Build
-
-```bash
-cargo build --release
+```
+┌────────────────────────────────────────────────┐
+│  id    │  1  │  2  │  3  │  4  │  5  │        │
+│  name  │ "A" │ "B" │ "C" │ "D" │ "E" │  …     │
+│  score │  92 │  77 │  85 │  91 │  68 │        │
+└────────────────────────────────────────────────┘
 ```
 
-### Create a table
+This means:
+- Column aggregations (`sum`, `avg`, `min`, `max`) touch only the target column
+- Projection pushdown skips loading columns not in `SELECT`
+- Null bitmaps are cheap — one bit per cell
+- Binary compression is effective because similar values are adjacent
 
-```bash
-vtf create users.vtf --columns "id:int,name:string,age:int,active:boolean" --primary-key id
+### VTF vs. SQLite vs. MongoDB
+
+| Feature                  | VTF          | SQLite         | MongoDB        |
+|--------------------------|:------------:|:--------------:|:--------------:|
+| Storage model            | Columnar     | Row (B-tree)   | Row (BSON)     |
+| Column aggregations      | Fast         | Full scan      | Full scan      |
+| Transactions             | ✅ WAL-based | ✅ WAL-based   | ✅ (multi-doc) |
+| Schema constraints       | UNIQUE, NOT NULL, DEFAULT | Full SQL | Optional |
+| Vector search            | ✅ Built-in  | ❌             | ❌ (separate)  |
+| File format              | Plain JSON + binary | SQLite binary | BSON |
+| Human-readable at rest   | ✅           | ❌             | ❌             |
+| Crash recovery           | WAL replay   | WAL replay     | Oplog replay   |
+| Embeds in Rust binary    | ✅           | via C FFI      | ❌             |
+| Server-ready foundation  | ✅ LSN + OCC | ✅             | ✅             |
+
+---
+
+## Architecture
+
+### Full Engine Pipeline
+
+```mermaid
+flowchart TD
+    CLI["vtf CLI"] --> Handler["CLI Handler"]
+    Handler --> Load["load_with_wal()\nJSON or Binary + WAL replay"]
+    Load --> Table["VtfTable\n(in-memory columnar store)"]
+    Table --> Engine
+
+    subgraph Engine["Engine Layer"]
+        Insert["insert() / insert_batch()\n• NOT NULL check\n• UNIQUE check\n• Apply defaults\n• Eager index update"]
+        Delete["delete()\n• Remove rows by index\n• Rebuild shifted indexes"]
+        Update["update()\n• NOT NULL check\n• UNIQUE check\n• Patch column values\n• Rebuild indexes"]
+        Schema["add_column() / create_index()"]
+        Txn["Transaction\n• Buffer ops\n• Commit atomically to WAL"]
+    end
+
+    subgraph Query["Query Engine"]
+        Parser["query_parser::parse()\nAST construction"]
+        Planner["plan_query()\n• HashIndexLookup\n• SortedIndexRange\n• ColumnScan\n• Selectivity check (<30%)"]
+        Executor["execute()\nApply plan → row indices"]
+        Agg["aggregate()\nCOUNT / SUM / AVG / MIN / MAX"]
+        Vector["vector_search()\nCosine / Euclidean top-K"]
+    end
+
+    subgraph Storage["Storage Layer"]
+        WAL["Write-Ahead Log (.vtf.wal)\nCRC32-checksummed entries\nTransaction markers"]
+        Binary["Binary encoder (.vtfb)\nColumn-wise zstd compression\nProjection pushdown"]
+        JSON["JSON serializer\nHuman-readable, round-trips cleanly"]
+        Compact["Compaction\nWAL → base file merge at threshold"]
+    end
+
+    Engine --> WAL
+    Engine --> Table
+    Query --> Table
+    Table --> JSON
+    Table --> Binary
+    WAL --> Compact
+    Compact --> JSON
 ```
 
-### Insert rows
+### WAL Lifecycle
+
+```mermaid
+flowchart LR
+    Mutation["Insert / Delete\nUpdate / Txn"] --> AppendWAL["Append to .vtf.wal\n(CRC32 + fsync)"]
+    AppendWAL --> Check{WAL size\n> threshold?}
+    Check -->|No| Done["Done — fast path"]
+    Check -->|Yes| Compact["Compact:\n1. Replay WAL onto table\n2. Save merged base file\n3. Delete .vtf.wal"]
+    Compact --> Done
+
+    Crash["Crash"] --> Reload["Reload:\n1. Load base .vtf file\n2. Read .vtf.wal\n3. Replay committed entries\n4. Restore LSN counter"]
+    Reload --> Ready["Table ready"]
+```
+
+---
+
+## File Format
+
+VTF tables are stored on disk as a JSON file (`.vtf`) plus an optional WAL (`.vtf.wal`):
+
+```json
+{
+  "version": "1.0",
+  "columns": [
+    { "name": "id",    "type": "int"    },
+    { "name": "email", "type": "string" },
+    { "name": "score", "type": "float"  }
+  ],
+  "rowCount": 3,
+  "data": {
+    "id":    [1, 2, 3],
+    "email": ["a@x.com", "b@x.com", "c@x.com"],
+    "score": [98.5, 74.2, 86.0]
+  },
+  "meta": {
+    "primaryKey": "id",
+    "uniqueColumns": ["email"],
+    "notNullColumns": ["email"],
+    "defaults": { "score": 0.0 }
+  },
+  "indexes": {
+    "id": { "type": "hash", "map": { "1": [0], "2": [1], "3": [2] } }
+  },
+  "lsn": 3
+}
+```
+
+### Supported Column Types
+
+| Type             | JSON form                     |
+|------------------|-------------------------------|
+| `int`            | `42`                          |
+| `float`          | `3.14`                        |
+| `string`         | `"hello"`                     |
+| `boolean`        | `true`                        |
+| `date`           | `"2024-01-15T00:00:00Z"`      |
+| `array<int>`     | `[1, 2, 3]`                   |
+| `array<float>`   | `[0.1, 0.9]`  (vector search) |
+| `array<string>`  | `["tag1", "tag2"]`            |
+
+---
+
+## Schema Constraints
+
+VTF v4 introduces three schema constraints, stored in `meta` and enforced on every write.
+
+### NOT NULL
+
+Rejects null values for the specified columns on insert and update.
 
 ```bash
-# Single row
-vtf insert users.vtf --row '{"id": 1, "name": "Alice", "age": 30, "active": true}'
+vtf create users.vtf --columns "id:int,email:string,name:string" \
+    --primary-key id \
+    --not-null "email,name"
+```
 
-# Batch insert (atomic — all or nothing)
-vtf insert users.vtf --rows '[
-  {"id": 2, "name": "Bob", "age": 25, "active": false},
-  {"id": 3, "name": "Charlie", "age": 35, "active": true}
+```bash
+# This will fail: name is NOT NULL
+vtf insert users.vtf --row '{"id":1,"email":"a@x.com","name":null}'
+# Error: not null constraint: column 'name' does not allow null values
+```
+
+### UNIQUE
+
+Ensures no two rows have the same value in the specified column (nulls are always permitted).
+
+```bash
+vtf create users.vtf --columns "id:int,email:string" \
+    --primary-key id \
+    --unique "email"
+```
+
+```bash
+# Second insert will fail if email already exists
+vtf insert users.vtf --row '{"id":2,"email":"a@x.com"}'
+# Error: unique constraint violation: duplicate value 'a@x.com' in column 'email'
+```
+
+### DEFAULT
+
+Fills in a column value when it is omitted from an insert. The default is applied before all other validation.
+
+```bash
+vtf create events.vtf --columns "id:int,status:string,score:float" \
+    --primary-key id \
+    --default '{"status":"pending","score":0.0}'
+```
+
+```bash
+# status and score will be filled from defaults
+vtf insert events.vtf --row '{"id":1}'
+```
+
+---
+
+## Transactions
+
+VTF v4 supports multi-operation transactions with atomicity and crash safety.
+
+### How it works
+
+```mermaid
+flowchart TD
+    BEGIN["BEGIN (txn_id = txn-...)"] --> Buffer["Buffer ops in memory\n(no disk writes yet)"]
+    Buffer --> Op1["Insert row {id:1}"]
+    Op1 --> Op2["Delete where id = 5"]
+    Op2 --> Op3["Update where id = 3"]
+    Op3 --> Decision{COMMIT or ROLLBACK?}
+
+    Decision -->|COMMIT| Flush["Write to WAL atomically:\nTxnBegin\nInsert\nDelete\nUpdate\nTxnCommit"]
+    Flush --> Apply["Apply all ops to\nin-memory table"]
+    Apply --> Done["Done ✅"]
+
+    Decision -->|ROLLBACK| Discard["Discard buffer\nNothing written to disk ✅"]
+```
+
+### Crash recovery
+
+If the process crashes after `TxnBegin` but before `TxnCommit`, WAL replay finds no matching `TxnCommit` and **silently skips the entire group**. The table is restored to the state before the transaction.
+
+### CLI usage
+
+```bash
+vtf txn users.vtf --ops '[
+  {"op": "insert", "row": {"id": 10, "name": "Alice", "email": "alice@x.com"}},
+  {"op": "delete", "where": "id = 5"},
+  {"op": "update", "where": "id = 3", "set": {"name": "Robert"}}
 ]'
+# Transaction committed (3 operations, rowCount: 42)
 ```
 
-### Query
+### Rust API
+
+```rust
+use vtf::engine::transaction::Transaction;
+
+let mut txn = Transaction::new();
+txn.insert(row1);
+txn.delete("id = 5", vec![json!(5)]);
+txn.update("id = 3", vec![json!(3)], updates);
+
+txn.commit(&vtf_path, &mut table)?;
+// or txn.rollback(); // discards everything
+```
+
+---
+
+## Query Engine
+
+### Filter syntax
 
 ```bash
-# All rows
-vtf query users.vtf
+# Equality
+vtf query users.vtf --where "status = active"
 
-# Simple equality filter
-vtf query users.vtf --where "name = 'Alice'"
-
-# Comparison operators
+# Comparison  
 vtf query users.vtf --where "age > 25"
+vtf query users.vtf --where "score <= 90"
 
-# Compound expressions with AND/OR/NOT
-vtf query users.vtf --where "age >= 25 AND active = true"
-vtf query users.vtf --where "(age > 30 OR name = 'Bob') AND active = true"
-vtf query users.vtf --where "NOT active = false"
+# Boolean combinator
+vtf query users.vtf --where "age > 25 AND active = true"
+vtf query users.vtf --where "role = admin OR role = moderator"
 
-# Select specific columns
-vtf query users.vtf --where "age > 25" --select "name,age"
-
-# Limit results
-vtf query users.vtf --where "age > 20" --limit 10
+# Negation
+vtf query users.vtf --where "NOT status = deleted"
 ```
 
-### Vector Similarity Search
+### EXPLAIN — query plan inspection
+
+The `explain` command shows exactly how VTF will execute a query without touching any data:
 
 ```bash
-# Create a table with embeddings
-vtf create docs.vtf --columns "id:int,text:string,embedding:array<float>" --primary-key id
+vtf explain users.vtf --where "age > 25 AND active = true"
+```
 
-# Insert documents with embedding vectors
-vtf insert docs.vtf --row '{"id": 1, "text": "hello world", "embedding": [0.12, -0.98, 0.44]}'
+```
+Query plan for: age > 25 AND active = true
 
-# Search for nearest vectors (cosine similarity, top 5)
-vtf search docs.vtf --column embedding --vector "[0.1, -0.9, 0.5]" --top-k 5 --metric cosine
+└── Intersect
+    ├── SortedIndexRange(age > 25)  [sorted index]
+    └── ColumnScan(active = true)   [full scan — no index on 'active']
 
-# Search with euclidean distance and select specific columns
-vtf search docs.vtf --column embedding --vector "[0.1, -0.9, 0.5]" --top-k 3 --metric euclidean --select "id,text"
+500 rows in table, 1 index(es) available
 ```
 
 ### Aggregations
 
 ```bash
-# Single function
-vtf aggregate users.vtf --column age --function avg
-
-# Multiple functions at once
-vtf aggregate users.vtf --column age --function "count,sum,avg,min,max"
-
-# Filtered aggregation
-vtf aggregate users.vtf --column age --function avg --where "active = true"
+vtf aggregate users.vtf --func count
+vtf aggregate users.vtf --func sum --column score
+vtf aggregate users.vtf --func avg --column score --where "active = true"
+vtf aggregate users.vtf --func min --column age
+vtf aggregate users.vtf --func max --column salary
 ```
 
-### Update rows
+### Vector search
 
 ```bash
-vtf update users.vtf --where "name=Bob" --set '{"age": 26, "active": true}'
+vtf search embeddings.vtf --column vector \
+    --vector "[0.1, 0.9, 0.3]" \
+    --top-k 5 \
+    --metric cosine
+```
+
+Supported metrics: `cosine`, `euclidean`
+
+---
+
+## Planner Selectivity
+
+The query planner automatically decides whether to use an index or a full column scan based on **selectivity**. If a query matches more than 30% of rows, a full scan is cheaper than index indirection:
+
+```
+For "active = true" where 80% of rows are active:
+  → ColumnScan  (index would touch 80% of rows anyway)
+
+For "id = 42" where 1 of 10,000 rows matches:
+  → HashIndexLookup  (highly selective)
+```
+
+---
+
+## Write-Ahead Log (WAL)
+
+Every mutation is first appended to `.vtf.wal` with a CRC32 checksum before touching the base file. On reload, VTF replays committed WAL entries on top of the base file.
+
+### WAL entry format
+
+```
+{"op":"insert","row":{"id":1,"name":"Alice"}}\t3f7a1b2c
+{"op":"delete","filter":"id = 5","pk_values":[5]}\ta1b2c3d4
+{"op":"txn_begin","txn_id":"txn-1714000000-0001"}\t...
+{"op":"insert","row":{"id":99,"name":"Bob"}}\t...
+{"op":"txn_commit","txn_id":"txn-1714000000-0001"}\t...
+```
+
+### Predicate-based Delete/Update
+
+Older databases store physical row indices in their WAL (`delete indices [3, 7]`). This breaks when earlier deletes shift row positions. VTF stores **logical predicates + primary key values** instead:
+
+```json
+{"op":"delete","filter":"status = deleted","pk_values":[3,7,12]}
+```
+
+On replay, VTF looks up the current row index for each PK — so the WAL is always safe to replay regardless of row shifts from earlier entries.
+
+---
+
+## Log Sequence Number (LSN)
+
+Every committed write increments `table.lsn`. The LSN is persisted in the JSON file and restored on reload.
+
+```bash
+vtf info users.vtf
+# VTF v1.0
+# Rows: 500
+# LSN: 47
+```
+
+The LSN is the foundation for **Optimistic Concurrency Control** when the server layer is added:
+
+```rust
+// Future server — at transaction commit time:
+if row.last_lsn > transaction.read_lsn {
+    return Err(VtfError::ConflictAbort(...));  // retry
+}
+```
+
+---
+
+## Server Roadmap
+
+VTF is designed to become a server-side database. The current embedded engine is the foundation:
+
+```mermaid
+flowchart LR
+    Now["Now (v4)\nEmbedded CLI\nWAL + Transactions\nSchema Constraints\nLSN Foundation"]
+
+    S1["Step 1\nArc<RwLock<TableStore>>\nMulti-table in-memory cache\nThread-safe reads"]
+
+    S2["Step 2\nOCC with LSN\nOptimistic conflict detection\nNo reader locking"]
+
+    S3["Step 3\nTCP listener\nJSON or binary framing\nConnection pool"]
+
+    S4["Step 4\nMulti-table joins\nShared WAL coordinator\nBackup / restore API"]
+
+    Now --> S1 --> S2 --> S3 --> S4
+```
+
+Each step builds on the previous:
+- **LSN** (done) enables OCC without complex lock management
+- **Predicate WAL** (done) makes replay safe across concurrent writes
+- **Transactions** (done) provide multi-op atomicity, which a server just exposes over the wire
+- **RwLock table store** wraps the existing `VtfTable` with no engine changes
+
+---
+
+## CLI Reference
+
+### Create a table
+
+```bash
+vtf create <file.vtf> \
+    --columns "col:type,col:type,..." \
+    [--primary-key <col>] \
+    [--unique "col1,col2"] \
+    [--not-null "col1,col2"] \
+    [--default '{"col": value}']
+```
+
+### Insert rows
+
+```bash
+vtf insert <file.vtf> --row '{"col": value, ...}'
+vtf insert <file.vtf> --rows '[{...}, {...}]'
+```
+
+### Query rows
+
+```bash
+vtf query <file.vtf> \
+    [--where "expr"] \
+    [--select "col1,col2"] \
+    [--limit N] \
+    [--format json|table]
 ```
 
 ### Delete rows
 
 ```bash
-vtf delete users.vtf --where "active=false"
+vtf delete <file.vtf> --where "col = value"
 ```
 
-### Table info
+### Update rows
 
 ```bash
-vtf info users.vtf
+vtf update <file.vtf> --where "col = value" --set '{"col": new_value}'
 ```
 
-### Indexes
+### Transactions
 
 ```bash
-# Create indexes
-vtf create-index users.vtf --column name --type hash
-vtf create-index users.vtf --column age --type sorted
+vtf txn <file.vtf> --ops '[
+  {"op":"insert","row":{...}},
+  {"op":"delete","where":"id = 5"},
+  {"op":"update","where":"id = 3","set":{"name":"Bob"}}
+]'
+```
 
-# Drop an index
-vtf drop-index users.vtf --column name
+### Explain a query plan
+
+```bash
+vtf explain <file.vtf> --where "age > 25 AND active = true"
+```
+
+### Aggregations
+
+```bash
+vtf aggregate <file.vtf> --func count|sum|avg|min|max [--column col] [--where expr]
+```
+
+### Vector search
+
+```bash
+vtf search <file.vtf> --column col --vector "[...]" --top-k N --metric cosine|euclidean
+```
+
+### Index management
+
+```bash
+vtf create-index <file.vtf> --column col --index-type hash|sorted
+vtf drop-index <file.vtf> --column col
+```
+
+### Schema
+
+```bash
+vtf add-column <file.vtf> --name col --col-type type
+vtf validate <file.vtf>
+vtf info <file.vtf>
 ```
 
 ### Export
 
 ```bash
-# JSON to stdout
-vtf export users.vtf
-vtf export users.vtf --pretty
-
-# Binary format
-vtf export users.vtf --format binary --output users.vtfb
-
-# Compressed format
-vtf export users.vtf --format compressed --output users.vtfz
-
-# JSON to file
-vtf export users.vtf --format json --output users.json
+vtf export <file.vtf> [--pretty] [--format json|binary]
 ```
 
-### Add a column
+---
+
+## Building
 
 ```bash
-vtf add-column users.vtf --name email --type string
-```
-
-## Library Usage
-
-```rust
-use vtf::*;
-use vtf::storage;
-use vtf::query::{parser, planner, vector, aggregate};
-use indexmap::IndexMap;
-use serde_json::json;
-
-// Create a table
-let mut table = VtfTable::new(vec![
-    Column { name: "id".into(), col_type: ColumnType::Int },
-    Column { name: "name".into(), col_type: ColumnType::String },
-    Column { name: "age".into(), col_type: ColumnType::Int },
-]);
-table.meta.primary_key = Some("id".into());
-
-// Insert
-let mut row = IndexMap::new();
-row.insert("id".into(), json!(1));
-row.insert("name".into(), json!("Alice"));
-row.insert("age".into(), json!(30));
-table.insert(row).unwrap();
-
-// Query with the expression engine
-let expr = parser::parse("age > 25 AND name = 'Alice'").unwrap();
-let plan = table.plan_query(&expr);
-let matches = planner::execute(&table, &plan).unwrap();
-let rows = table.select_rows(&matches, &["id", "name"]).unwrap();
-
-// Aggregation — operates directly on column vectors
-let avg_age = aggregate::avg(&table.data["age"], None).unwrap();
-
-// Create indexes for faster queries
-table.create_index("name", IndexType::Hash).unwrap();
-table.create_index("age", IndexType::Sorted).unwrap();
-
-// Vector similarity search
-// (requires an array<float> column — see vector::top_k)
-let results = vector::top_k(
-    &table, "embedding", &[0.1, -0.9, 0.5], 5, vector::Metric::Cosine
-);
-
-// Save / Load with WAL for crash safety
-storage::save(&table, std::path::Path::new("data.vtf")).unwrap();
-let loaded = storage::load_with_wal(std::path::Path::new("data.vtf")).unwrap();
-
-// Binary and compressed formats
-let bytes = storage::binary::encode(&table).unwrap();
-let decoded = storage::binary::decode(&bytes).unwrap();
-let compressed = storage::compression::encode_compressed(&table).unwrap();
-let decoded = storage::compression::decode_compressed(&compressed).unwrap();
-```
-
-## Project Structure
-
-```
-src/
-  lib.rs                Top-level module declarations + re-exports
-  main.rs               Thin CLI entry point
-
-  core/
-    error.rs            VtfError enum (thiserror)
-    model.rs            VtfTable, Column, ColumnData, IndexDef, Meta
-    types.rs            Type parsing, date validation, value type checking
-
-  storage/
-    validation.rs       7-step strict validation pipeline
-    json.rs             JSON serialization (compact + pretty)
-    io.rs               Atomic file I/O with advisory locking
-    binary.rs           Column-wise binary encoding with null bitmaps + partial decode
-    compression.rs      Zstd-compressed binary format
-    wal.rs              Write-ahead log with CRC32 checksums
-    compaction.rs       WAL-to-base-file merge with auto-trigger + replay timing
-
-  engine/
-    insert.rs           Atomic single-row and batch insert
-    delete.rs           Row deletion with index rebuild
-    update.rs           Partial row update with PK safety
-    schema.rs           Schema evolution (add column)
-
-  query/
-    ast.rs              Expression AST (Eq, Neq, Gt, Gte, Lt, Lte, And, Or, Not)
-    parser.rs           Recursive-descent query parser
-    filter.rs           Equality filter, column scan, expression evaluation
-    planner.rs          Query planner (index selection) + executor + required_columns
-    vector.rs           Cosine similarity, euclidean distance, brute-force top-K
-    aggregate.rs        COUNT, SUM, AVG, MIN, MAX on ColumnData vectors
-
-  index/
-    hash.rs             Hash index construction
-    sorted.rs           Sorted index construction + range queries
-    rebuild.rs          Index create / rebuild / drop on VtfTable
-
-  cli/
-    commands.rs         Clap struct/enum definitions (13 subcommands)
-    handlers.rs         CLI command handlers with timing instrumentation
-
-benches/
-  vtf_bench.rs          Criterion benchmarks (insert, query, encode, decode)
-
-tests/
-  validation_tests.rs   30 validation edge cases
-  insert_tests.rs       13 insert scenarios
-  batch_insert_tests.rs 11 batch insert tests
-  delete_tests.rs        6 delete integration tests
-  update_tests.rs        8 update integration tests
-  query_tests.rs        15 query tests
-  storage_tests.rs      12 storage round-trip tests
-  edge_cases.rs         11 end-to-end edge cases
-```
-
-## Running Tests
-
-```bash
+git clone https://github.com/your-org/VTF-db
+cd VTF-db
+cargo build --release
 cargo test
 ```
 
-## Benchmarks
+The binary is at `target/release/vtf`.
 
-```bash
-cargo bench
-```
-
-## Architecture
-
-### Module Dependency DAG
-
-```
-core/ ──────┬──> index/ ──┬──> engine/
-            │             ├──> query/  (filter, AST, parser, planner, vector, aggregate)
-            ├─────────────┼──> storage/ (validation, json, binary, compression, wal, compaction)
-            └─────────────┴──> cli/
-```
-
-- **core/** — zero dependencies on other VTF modules (error types, data model, type system)
-- **index/** — depends only on core (hash/sorted index building)
-- **engine/** — depends on core + index (insert, delete, update, schema)
-- **query/** — depends on core + index (filter, AST, parser, planner/executor, vector search, aggregations)
-- **storage/** — depends on core (validation, JSON, binary, WAL with CRC32, compaction)
-- **cli/** — depends on everything (thin command routing with timing instrumentation)
-
-### Storage Formats
-
-| Format     | Magic Bytes | Extension | Use Case |
-|------------|-------------|-----------|----------|
-| JSON       | `{`         | `.vtf`    | Human-readable, debugging, interop |
-| Binary     | `VTFb`      | `.vtf`    | Compact storage, fast decode, projection pushdown |
-| Compressed | `VTFz`      | `.vtf`    | Maximum space efficiency |
-
-### Write-Ahead Log
-
-All mutations go through the WAL by default. Each entry is written as a single JSON line followed by a CRC32 checksum (tab-separated). On load, the base file is read and WAL entries are replayed. Corrupt entries (checksum mismatch or invalid JSON) are skipped with a warning to stderr — only valid entries are applied. When the WAL exceeds 100 entries, automatic compaction merges everything into a new base file and deletes the WAL.
-
-## Design Decisions
-
-- **IndexMap over HashMap** for `data` — preserves column insertion order for deterministic output
-- **Layered module architecture** — enforces a strict dependency DAG, prevents circular dependencies
-- **WAL-first write path** — all mutations are logged to WAL before compaction; no direct save after mutation
-- **CRC32 per WAL line** — lightweight corruption detection without the overhead of cryptographic hashes
-- **Graceful corruption recovery** — bad WAL entries are skipped rather than failing the entire load
-- **Query AST + planner** — separates parsing, planning, and execution for testability and extensibility
-- **Projection pushdown in binary format** — `decode_partial` skips unneeded columns at the byte level
-- **Brute-force vector search** — correct and simple; ANN indexes (HNSW, IVF) are out of scope for now
-- **Aggregations on raw ColumnData** — the columnar layout means no row reconstruction for COUNT/SUM/AVG/MIN/MAX
-- **WAL before binary format** — eliminates the O(n) rewrite bottleneck before optimizing file size
-- **JSON-lines WAL** — simple, debuggable; binary WAL can be added later
-- **Null bitmaps in binary format** — 1 bit per row per column, compact representation of nullable data
-- **Advisory file locking** — prevents concurrent write corruption without requiring a daemon process
-- **Copy-on-write insert atomicity** — new values built in temporaries, only committed if all columns succeed
-- **Index rebuild after delete/update** — simplest correct approach since row indices shift
-- **Timing via stderr** — observability without polluting stdout output that may be piped
+---
 
 ## License
 

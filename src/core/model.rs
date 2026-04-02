@@ -240,6 +240,12 @@ impl ColumnData {
 #[derive(Debug, Clone)]
 pub struct Meta {
     pub primary_key: Option<std::string::String>,
+    /// Columns that must have unique values (beyond the primary key).
+    pub unique_columns: Vec<std::string::String>,
+    /// Columns that reject null values on insert/update.
+    pub not_null_columns: Vec<std::string::String>,
+    /// Default values applied when a column is omitted from an insert.
+    pub defaults: IndexMap<std::string::String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +272,10 @@ pub struct VtfTable {
     pub meta: Meta,
     pub indexes: IndexMap<std::string::String, IndexDef>,
     pub extensions: serde_json::Value,
+    /// Log Sequence Number — incremented on every committed write.
+    /// Monotonically increasing; used as the foundation for optimistic
+    /// concurrency control in future server mode.
+    pub lsn: u64,
 }
 
 impl VtfTable {
@@ -279,9 +289,15 @@ impl VtfTable {
             columns,
             row_count: 0,
             data,
-            meta: Meta { primary_key: None },
+            meta: Meta {
+                primary_key: None,
+                unique_columns: Vec::new(),
+                not_null_columns: Vec::new(),
+                defaults: IndexMap::new(),
+            },
             indexes: IndexMap::new(),
             extensions: serde_json::Value::Object(serde_json::Map::new()),
+            lsn: 0,
         }
     }
 

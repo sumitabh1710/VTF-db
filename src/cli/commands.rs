@@ -20,6 +20,15 @@ pub enum Commands {
         /// Primary key column name
         #[arg(long)]
         primary_key: Option<String>,
+        /// Comma-separated columns that must be unique: "email,username"
+        #[arg(long)]
+        unique: Option<String>,
+        /// Comma-separated columns that reject null values: "name,email"
+        #[arg(long)]
+        not_null: Option<String>,
+        /// Default values as a JSON object: '{"status":"active","score":0}'
+        #[arg(long)]
+        default: Option<String>,
     },
     /// Validate a VTF file
     Validate {
@@ -133,6 +142,22 @@ pub enum Commands {
         /// Columns to display in results (comma-separated)
         #[arg(long)]
         select: Option<String>,
+    },
+    /// Show the query execution plan without running the query
+    Explain {
+        /// VTF file path
+        file: PathBuf,
+        /// Filter expression to explain
+        #[arg(long, name = "where", required = true)]
+        filter: String,
+    },
+    /// Execute multiple operations as a single atomic transaction
+    Txn {
+        /// VTF file path
+        file: PathBuf,
+        /// Operations as a JSON array: '[{"op":"insert","row":{...}},{"op":"delete","where":"id=5"}]'
+        #[arg(long)]
+        ops: String,
     },
     /// Drop an index from a column
     DropIndex {

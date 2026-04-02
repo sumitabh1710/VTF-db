@@ -32,6 +32,8 @@ fn command_label(cmd: &Commands) -> &'static str {
         Commands::Search { .. } => "SEARCH",
         Commands::Aggregate { .. } => "AGGREGATE",
         Commands::DropIndex { .. } => "DROP-INDEX",
+        Commands::Txn { .. } => "TXN",
+        Commands::Explain { .. } => "EXPLAIN",
         Commands::AddColumn { .. } => "ADD-COLUMN",
         Commands::CreateIndex { .. } => "CREATE-INDEX",
     }
@@ -43,7 +45,17 @@ fn run_inner(command: Commands) -> Result<(), VtfError> {
             file,
             columns,
             primary_key,
-        } => cmd_create(&file, &columns, primary_key.as_deref()),
+            unique,
+            not_null,
+            default,
+        } => cmd_create(
+            &file,
+            &columns,
+            primary_key.as_deref(),
+            unique.as_deref(),
+            not_null.as_deref(),
+            default.as_deref(),
+        ),
 
         Commands::Validate { file } => cmd_validate(&file),
 
@@ -72,6 +84,10 @@ fn run_inner(command: Commands) -> Result<(), VtfError> {
             function,
             filter,
         } => cmd_aggregate(&file, &column, &function, filter.as_deref()),
+
+        Commands::Txn { file, ops } => cmd_txn(&file, &ops),
+
+        Commands::Explain { file, filter } => cmd_explain(&file, &filter),
 
         Commands::DropIndex { file, column } => cmd_drop_index(&file, &column),
 
@@ -102,6 +118,9 @@ fn cmd_create(
     file: &PathBuf,
     columns_str: &str,
     primary_key: Option<&str>,
+    unique: Option<&str>,
+    not_null: Option<&str>,
+    default: Option<&str>,
 ) -> Result<(), VtfError> {
     let columns = parse_columns(columns_str)?;
     let mut table = VtfTable::new(columns);
@@ -113,6 +132,42 @@ fn cmd_create(
             )));
         }
         table.meta.primary_key = Some(pk.to_string());
+    }
+
+    if let Some(unique_str) = unique {
+        for col_name in unique_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if table.find_column(col_name).is_none() {
+                return Err(VtfError::validation(format!(
+                    "--unique column '{col_name}' not found in columns"
+                )));
+            }
+            table.meta.unique_columns.push(col_name.to_string());
+        }
+    }
+
+    if let Some(not_null_str) = not_null {
+        for col_name in not_null_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if table.find_column(col_name).is_none() {
+                return Err(VtfError::validation(format!(
+                    "--not-null column '{col_name}' not found in columns"
+                )));
+            }
+            table.meta.not_null_columns.push(col_name.to_string());
+        }
+    }
+
+    if let Some(default_str) = default {
+        let val: serde_json::Value = serde_json::from_str(default_str)
+            .map_err(|e| VtfError::validation(format!("invalid --default JSON: {e}")))?;
+        let obj = val.as_object().ok_or_else(|| VtfError::validation("--default must be a JSON object"))?;
+        for (col_name, default_val) in obj {
+            if table.find_column(col_name).is_none() {
+                return Err(VtfError::validation(format!(
+                    "--default references unknown column '{col_name}'"
+                )));
+            }
+            table.meta.defaults.insert(col_name.clone(), default_val.clone());
+        }
     }
 
     // Create writes the initial base file directly (no WAL for new files)
@@ -179,15 +234,20 @@ fn cmd_insert(
 
 fn cmd_delete(file: &PathBuf, filter_str: &str) -> Result<(), VtfError> {
     let mut table = storage::load_with_wal(file)?;
-    let (col, val) = parse_filter(filter_str)?;
-    let indices = table.filter_eq(&col, &val)?;
 
+    let indices = resolve_filter_indices(&table, filter_str)?;
     if indices.is_empty() {
         println!("No matching rows to delete.");
         return Ok(());
     }
 
-    let wal_entry = WalEntry::Delete { indices: indices.clone() };
+    // Collect PK values before the delete shifts row positions
+    let pk_values = collect_pk_values(&table, &indices);
+
+    let wal_entry = WalEntry::Delete {
+        filter: filter_str.to_string(),
+        pk_values,
+    };
     let count = table.delete(&indices)?;
     storage::save_with_wal(file, &wal_entry)?;
     println!("Deleted {count} rows (rowCount: {})", table.row_count);
@@ -196,9 +256,8 @@ fn cmd_delete(file: &PathBuf, filter_str: &str) -> Result<(), VtfError> {
 
 fn cmd_update(file: &PathBuf, filter_str: &str, set_json: &str) -> Result<(), VtfError> {
     let mut table = storage::load_with_wal(file)?;
-    let (col, val) = parse_filter(filter_str)?;
-    let indices = table.filter_eq(&col, &val)?;
 
+    let indices = resolve_filter_indices(&table, filter_str)?;
     if indices.is_empty() {
         println!("No matching rows to update.");
         return Ok(());
@@ -215,8 +274,12 @@ fn cmd_update(file: &PathBuf, filter_str: &str, set_json: &str) -> Result<(), Vt
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
+    // Collect PK values before the update (in case PK is being changed)
+    let pk_values = collect_pk_values(&table, &indices);
+
     let wal_entry = WalEntry::Update {
-        indices: indices.clone(),
+        filter: filter_str.to_string(),
+        pk_values,
         values: values.clone(),
     };
     let count = table.update(&indices, values)?;
@@ -265,20 +328,99 @@ fn cmd_query(
     Ok(())
 }
 
+fn cmd_explain(file: &PathBuf, filter_str: &str) -> Result<(), VtfError> {
+    let table = storage::load_with_wal(file)?;
+    let expr = query_parser::parse(filter_str)
+        .map_err(|e| VtfError::query(format!("failed to parse filter: {e}")))?;
+    let plan = table.plan_query(&expr);
+    println!("Query plan for: {filter_str}\n");
+    print_plan(&plan, "", true);
+    println!("\n{} rows in table, {} index(es) available", table.row_count, table.indexes.len());
+    Ok(())
+}
+
+fn print_plan(plan: &crate::query::planner::Plan, prefix: &str, is_last: bool) {
+    use crate::query::planner::Plan;
+    let connector = if is_last { "└── " } else { "├── " };
+    let child_prefix = if is_last {
+        format!("{prefix}    ")
+    } else {
+        format!("{prefix}│   ")
+    };
+
+    match plan {
+        Plan::HashIndexLookup { column, value } => {
+            println!("{prefix}{connector}HashIndexLookup({column} = {value})  [index scan]");
+        }
+        Plan::SortedIndexRange { column, low, high, low_inclusive, high_inclusive } => {
+            let range = match (low, high) {
+                (Some(lo), Some(hi)) => {
+                    let lo_op = if *low_inclusive { ">=" } else { ">" };
+                    let hi_op = if *high_inclusive { "<=" } else { "<" };
+                    format!("{column} {lo_op} {lo} AND {column} {hi_op} {hi}")
+                }
+                (Some(lo), None) => {
+                    let op = if *low_inclusive { ">=" } else { ">" };
+                    format!("{column} {op} {lo}")
+                }
+                (None, Some(hi)) => {
+                    let op = if *high_inclusive { "<=" } else { "<" };
+                    format!("{column} {op} {hi}")
+                }
+                (None, None) => format!("{column} (full range)"),
+            };
+            println!("{prefix}{connector}SortedIndexRange({range})  [sorted index]");
+        }
+        Plan::ColumnScan { expr } => {
+            println!("{prefix}{connector}ColumnScan({expr})  [full scan]");
+        }
+        Plan::Intersect(left, right) => {
+            println!("{prefix}{connector}Intersect");
+            print_plan(left, &child_prefix, false);
+            print_plan(right, &child_prefix, true);
+        }
+        Plan::Union(left, right) => {
+            println!("{prefix}{connector}Union");
+            print_plan(left, &child_prefix, false);
+            print_plan(right, &child_prefix, true);
+        }
+        Plan::Complement(inner) => {
+            println!("{prefix}{connector}Complement");
+            print_plan(inner, &child_prefix, true);
+        }
+    }
+}
+
 fn cmd_info(file: &PathBuf) -> Result<(), VtfError> {
     let table = storage::load_with_wal(file)?;
 
     println!("VTF v{}", table.version);
     println!("Rows: {}", table.row_count);
+    println!("LSN: {}", table.lsn);
     println!();
     println!("Columns:");
     for col in &table.columns {
-        let pk_marker = if table.meta.primary_key.as_deref() == Some(&col.name) {
-            " [PK]"
+        let mut markers = Vec::new();
+        if table.meta.primary_key.as_deref() == Some(&col.name) {
+            markers.push("PK");
+        }
+        if table.meta.unique_columns.contains(&col.name) {
+            markers.push("UNIQUE");
+        }
+        if table.meta.not_null_columns.contains(&col.name) {
+            markers.push("NOT NULL");
+        }
+        let annotation = if markers.is_empty() {
+            String::new()
         } else {
-            ""
+            format!(" [{}]", markers.join(", "))
         };
-        println!("  {} : {}{}", col.name, col.col_type.as_str(), pk_marker);
+        let default_str = if let Some(dv) = table.meta.defaults.get(&col.name) {
+            format!(" DEFAULT={dv}")
+        } else {
+            String::new()
+        };
+        println!("  {} : {}{}{}", col.name, col.col_type.as_str(), annotation, default_str);
     }
 
     if !table.indexes.is_empty() {
@@ -408,6 +550,79 @@ fn cmd_drop_index(file: &PathBuf, column: &str) -> Result<(), VtfError> {
     table.drop_index(column)?;
     storage::save(&table, file)?;
     println!("Dropped index on column '{column}'");
+    Ok(())
+}
+
+fn cmd_txn(file: &PathBuf, ops_json: &str) -> Result<(), VtfError> {
+    use crate::engine::transaction::Transaction;
+
+    let ops_val: serde_json::Value = serde_json::from_str(ops_json)
+        .map_err(|e| VtfError::insert(format!("invalid --ops JSON: {e}")))?;
+    let ops_arr = ops_val
+        .as_array()
+        .ok_or_else(|| VtfError::insert("--ops must be a JSON array"))?;
+
+    let mut table = storage::load_with_wal(file)?;
+    let mut txn = Transaction::new();
+
+    for (i, op_val) in ops_arr.iter().enumerate() {
+        let op_obj = op_val
+            .as_object()
+            .ok_or_else(|| VtfError::insert(format!("ops[{i}] must be a JSON object")))?;
+
+        let op_type = op_obj.get("op").and_then(|v| v.as_str()).ok_or_else(|| {
+            VtfError::insert(format!("ops[{i}] must have an \"op\" field"))
+        })?;
+
+        match op_type {
+            "insert" => {
+                let row_val = op_obj.get("row").ok_or_else(|| {
+                    VtfError::insert(format!("ops[{i}] insert requires a \"row\" field"))
+                })?;
+                let row_obj = row_val.as_object().ok_or_else(|| {
+                    VtfError::insert(format!("ops[{i}] insert \"row\" must be an object"))
+                })?;
+                let row: IndexMap<String, serde_json::Value> =
+                    row_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                txn.insert(row);
+            }
+            "delete" => {
+                let filter_str = op_obj
+                    .get("where")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| VtfError::insert(format!("ops[{i}] delete requires a \"where\" field")))?;
+                let indices = resolve_filter_indices(&table, filter_str)?;
+                let pk_values = collect_pk_values(&table, &indices);
+                txn.delete(filter_str, pk_values);
+            }
+            "update" => {
+                let filter_str = op_obj
+                    .get("where")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| VtfError::insert(format!("ops[{i}] update requires a \"where\" field")))?;
+                let set_val = op_obj.get("set").ok_or_else(|| {
+                    VtfError::insert(format!("ops[{i}] update requires a \"set\" field"))
+                })?;
+                let set_obj = set_val.as_object().ok_or_else(|| {
+                    VtfError::insert(format!("ops[{i}] update \"set\" must be an object"))
+                })?;
+                let values: IndexMap<String, serde_json::Value> =
+                    set_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let indices = resolve_filter_indices(&table, filter_str)?;
+                let pk_values = collect_pk_values(&table, &indices);
+                txn.update(filter_str, pk_values, values);
+            }
+            other => {
+                return Err(VtfError::insert(format!(
+                    "ops[{i}]: unknown operation type '{other}' (expected: insert, delete, update)"
+                )));
+            }
+        }
+    }
+
+    let op_count = txn.op_count();
+    txn.commit(file, &mut table)?;
+    println!("Transaction committed ({op_count} operations, rowCount: {})", table.row_count);
     Ok(())
 }
 
@@ -567,6 +782,26 @@ fn parse_columns(s: &str) -> Result<Vec<Column>, VtfError> {
         return Err(VtfError::validation("no columns specified"));
     }
     Ok(columns)
+}
+
+/// Resolve a filter string to row indices using the full query parser + planner.
+/// Falls back to the simple equality parser if the full parser fails.
+fn resolve_filter_indices(table: &VtfTable, filter_str: &str) -> Result<Vec<usize>, VtfError> {
+    if let Ok(expr) = query_parser::parse(filter_str) {
+        let plan = table.plan_query(&expr);
+        crate::query::planner::execute(table, &plan)
+    } else {
+        let (col, val) = parse_filter(filter_str)?;
+        table.filter_eq(&col, &val)
+    }
+}
+
+/// Collect the primary key values for the given row indices.
+/// Returns an empty Vec if the table has no primary key.
+fn collect_pk_values(table: &VtfTable, indices: &[usize]) -> Vec<serde_json::Value> {
+    let Some(ref pk) = table.meta.primary_key else { return Vec::new() };
+    let Some(col_data) = table.data.get(pk) else { return Vec::new() };
+    indices.iter().filter_map(|&i| col_data.get_json_value(i)).collect()
 }
 
 fn parse_filter(s: &str) -> Result<(String, serde_json::Value), VtfError> {
