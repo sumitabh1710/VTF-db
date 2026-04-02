@@ -42,6 +42,51 @@ This means:
 
 ---
 
+## What's new in V3
+
+V3 is the release line built on the v2 storage stack (JSON/binary on disk, advisory locking, CRC32 WAL lines). It wires that WAL into the **write path**, adds **CLI aggregations** and **multi-operation transactions**, and extends the format with **LSN** and optional **schema constraints**. The rough split from git history:
+
+| Milestone | What shipped |
+|-----------|----------------|
+| **v2** | Columnar engine, binary + zstd, WAL file format, compaction, file locking |
+| **v3 (wave 1)** | **`save_with_wal` on every mutation**, **`vtf aggregate`**, replay timing logs |
+| **v3 (wave 2)** | **`vtf txn`** + `Transaction` API, `txn_begin` / `txn_commit` in the WAL, crash-safe partial-transaction discard |
+
+### WAL on the hot path
+
+- Every insert, delete, update, and committed transaction appends one logical entry to **`.vtf.wal`** (JSON line + tab-separated **CRC32**), then applies the change in memory. The base `.vtf` file is refreshed through **compaction**, not on every op.
+- **`load_with_wal`** loads the base table, replays the WAL, and logs `[WAL] Replayed N entries in …ms` to stderr when the WAL is non-empty.
+- **Auto-compaction** runs when the WAL holds **100** or more entries (see `DEFAULT_COMPACTION_THRESHOLD` in `src/storage/wal.rs`): replay into a new base file, then delete the WAL.
+
+### `vtf aggregate`
+
+- Runs **`count`**, **`sum`**, **`avg`**, **`min`**, **`max`** directly on a column’s vector (`--column` / `--function`).
+- **`--function`** accepts a comma-separated list to print several aggregates in one invocation.
+- Optional **`--where`** uses the same filter and expression syntax as **`vtf query`**.
+
+### `vtf txn` and `Transaction`
+
+- **`vtf txn <file> --ops '[...]'`** takes a JSON array of **`insert`** (with **`row`**), **`delete`** (with **`where`**), and **`update`** (with **`where`** + **`set`**). Each operation is validated against the current table before anything is written.
+- On commit, the engine writes **`txn_begin`** { `txn_id` }, each operation, then **`txn_commit`** { `txn_id` } to the WAL and applies the batch to the table.
+- In Rust, **`Transaction::insert`**, **`insert_batch`**, **`delete`**, and **`update`** buffer ops; **`commit(path, &mut table)`** flushes to WAL and applies, **`rollback()`** drops the buffer with no disk write.
+- If the process dies after **`txn_begin`** but before **`txn_commit`**, replay **skips the whole uncommitted group** so the table never sees a half-finished transaction.
+
+### `vtf explain`
+
+- Loads the table (including WAL replay) and prints the **query plan** for a **`--where`** expression: hash index lookup, sorted index range, column scan, and how **`AND` / `OR` / `NOT`** combine. It does **not** print result rows—only how the planner would execute the filter.
+
+### Schema constraints on `vtf create`
+
+- **`--unique "col,col"`** — non-null duplicate values rejected (nulls still allowed in nullable columns).
+- **`--not-null "col,col"`** — insert/update may not set those columns to JSON `null`.
+- **`--default '{"col": value}'`** — missing keys on insert are filled before NOT NULL / UNIQUE checks.
+
+### LSN
+
+- **`lsn`** increments on each successful WAL append and is stored in the table JSON. It is restored after restart and is intended as the hook for **optimistic concurrency** in a future server layer.
+
+---
+
 ## Architecture
 
 ### Full Engine Pipeline
@@ -149,7 +194,7 @@ VTF tables are stored on disk as a JSON file (`.vtf`) plus an optional WAL (`.vt
 
 ## Schema Constraints
 
-VTF v4 introduces three schema constraints, stored in `meta` and enforced on every write.
+VTF v3 adds three optional schema constraints, stored in `meta` and enforced on every insert and update.
 
 ### NOT NULL
 
@@ -202,7 +247,7 @@ vtf insert events.vtf --row '{"id":1}'
 
 ## Transactions
 
-VTF v4 supports multi-operation transactions with atomicity and crash safety.
+VTF v3 supports multi-operation transactions with atomicity and crash safety (see [What's new in V3](#whats-new-in-v3)).
 
 ### How it works
 
@@ -274,7 +319,7 @@ vtf query users.vtf --where "NOT status = deleted"
 
 ### EXPLAIN — query plan inspection
 
-The `explain` command shows exactly how VTF will execute a query without touching any data:
+The `explain` command loads the table (and replays the WAL), parses **`--where`**, and prints the planner tree. It does **not** evaluate the filter over rows for output—it only shows the execution strategy:
 
 ```bash
 vtf explain users.vtf --where "age > 25 AND active = true"
@@ -293,11 +338,11 @@ Query plan for: age > 25 AND active = true
 ### Aggregations
 
 ```bash
-vtf aggregate users.vtf --func count
-vtf aggregate users.vtf --func sum --column score
-vtf aggregate users.vtf --func avg --column score --where "active = true"
-vtf aggregate users.vtf --func min --column age
-vtf aggregate users.vtf --func max --column salary
+vtf aggregate users.vtf --column id --function count
+vtf aggregate users.vtf --column score --function sum
+vtf aggregate users.vtf --column score --function avg --where "active = true"
+vtf aggregate users.vtf --column age --function min
+vtf aggregate users.vtf --column salary --function max
 ```
 
 ### Vector search
@@ -329,7 +374,7 @@ For "id = 42" where 1 of 10,000 rows matches:
 
 ## Write-Ahead Log (WAL)
 
-Every mutation is first appended to `.vtf.wal` with a CRC32 checksum before touching the base file. On reload, VTF replays committed WAL entries on top of the base file.
+Every mutation is first appended to `.vtf.wal` with a CRC32 checksum; the base `.vtf` file is updated when **compaction** merges the WAL (by default after **100** WAL entries—see v3 notes above). On reload, VTF replays committed WAL entries on top of the base file.
 
 ### WAL entry format
 
@@ -381,7 +426,7 @@ VTF is designed to become a server-side database. The current embedded engine is
 
 ```mermaid
 flowchart LR
-    Now["Now (v4)\nEmbedded CLI\nWAL + Transactions\nSchema Constraints\nLSN Foundation"]
+    Now["Now (v3)\nEmbedded CLI\nWAL + Transactions\nSchema constraints\nLSN foundation"]
 
     S1["Step 1\nArc<RwLock<TableStore>>\nMulti-table in-memory cache\nThread-safe reads"]
 
@@ -399,6 +444,79 @@ Each step builds on the previous:
 - **Predicate WAL** (done) makes replay safe across concurrent writes
 - **Transactions** (done) provide multi-op atomicity, which a server just exposes over the wire
 - **RwLock table store** wraps the existing `VtfTable` with no engine changes
+
+---
+
+## Quick Start
+
+### Build
+
+```bash
+cargo build --release
+```
+
+### Create a table
+
+```bash
+vtf create users.vtf --columns "id:int,name:string,age:int,active:boolean" --primary-key id
+```
+
+### Insert rows
+
+```bash
+vtf insert users.vtf --row '{"id": 1, "name": "Alice", "age": 30, "active": true}'
+
+vtf insert users.vtf --rows '[
+  {"id": 2, "name": "Bob", "age": 25, "active": false},
+  {"id": 3, "name": "Charlie", "age": 35, "active": true}
+]'
+```
+
+### Query
+
+```bash
+vtf query users.vtf
+vtf query users.vtf --where "age > 25"
+vtf query users.vtf --where "age >= 25 AND active = true" --select "name,age" --limit 10
+```
+
+### Vector similarity search
+
+```bash
+vtf create docs.vtf --columns "id:int,text:string,embedding:array<float>" --primary-key id
+vtf insert docs.vtf --row '{"id": 1, "text": "hello", "embedding": [0.12, -0.98, 0.44]}'
+vtf search docs.vtf --column embedding --vector "[0.1, -0.9, 0.5]" --top-k 5 --metric cosine
+```
+
+### Aggregations
+
+```bash
+vtf aggregate users.vtf --column age --function avg
+vtf aggregate users.vtf --column age --function "count,sum,avg,min,max" --where "active = true"
+```
+
+### Indexes
+
+```bash
+vtf create-index users.vtf --column name --type hash
+vtf create-index users.vtf --column age --type sorted
+vtf drop-index users.vtf --column name
+```
+
+### Export
+
+```bash
+vtf export users.vtf
+vtf export users.vtf --pretty
+vtf export users.vtf --format binary --output users.vtfb
+vtf export users.vtf --format compressed --output users.vtfz
+```
+
+### Add a column
+
+```bash
+vtf add-column users.vtf --name email --type string
+```
 
 ---
 
@@ -428,8 +546,7 @@ vtf insert <file.vtf> --rows '[{...}, {...}]'
 vtf query <file.vtf> \
     [--where "expr"] \
     [--select "col1,col2"] \
-    [--limit N] \
-    [--format json|table]
+    [--limit N]
 ```
 
 ### Delete rows
@@ -463,7 +580,8 @@ vtf explain <file.vtf> --where "age > 25 AND active = true"
 ### Aggregations
 
 ```bash
-vtf aggregate <file.vtf> --func count|sum|avg|min|max [--column col] [--where expr]
+vtf aggregate <file.vtf> --column <col> --function <fn>[,<fn>...] [--where expr]
+# fn: count, sum, avg, min, max
 ```
 
 ### Vector search
@@ -475,14 +593,14 @@ vtf search <file.vtf> --column col --vector "[...]" --top-k N --metric cosine|eu
 ### Index management
 
 ```bash
-vtf create-index <file.vtf> --column col --index-type hash|sorted
+vtf create-index <file.vtf> --column col --type hash|sorted
 vtf drop-index <file.vtf> --column col
 ```
 
 ### Schema
 
 ```bash
-vtf add-column <file.vtf> --name col --col-type type
+vtf add-column <file.vtf> --name col --type <type>
 vtf validate <file.vtf>
 vtf info <file.vtf>
 ```
@@ -490,7 +608,7 @@ vtf info <file.vtf>
 ### Export
 
 ```bash
-vtf export <file.vtf> [--pretty] [--format json|binary]
+vtf export <file.vtf> [--pretty] [--format json|binary|compressed] [--output <path>]
 ```
 
 ---
