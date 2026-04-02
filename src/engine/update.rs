@@ -42,6 +42,16 @@ impl VtfTable {
             types::validate_value(val, &col.col_type, col_name, 0)?;
         }
 
+        // NOT NULL enforcement
+        let not_null_cols = self.meta.not_null_columns.clone();
+        for col_name in &not_null_cols {
+            if let Some(val) = values.get(col_name) {
+                if val.is_null() {
+                    return Err(VtfError::NotNullViolation { column: col_name.clone() });
+                }
+            }
+        }
+
         if let Some(ref pk) = self.meta.primary_key {
             if let Some(new_pk_val) = values.get(pk) {
                 if new_pk_val.is_null() {
@@ -51,6 +61,17 @@ impl VtfTable {
                 }
                 let updating_set: HashSet<usize> = indices.iter().copied().collect();
                 self.check_pk_update_uniqueness(pk, new_pk_val, &updating_set)?;
+            }
+        }
+
+        // UNIQUE constraint enforcement
+        let unique_cols = self.meta.unique_columns.clone();
+        let updating_set: HashSet<usize> = indices.iter().copied().collect();
+        for col_name in &unique_cols {
+            if let Some(new_val) = values.get(col_name) {
+                if !new_val.is_null() {
+                    self.check_unique_for_update(col_name, new_val, &updating_set)?;
+                }
             }
         }
 
@@ -74,6 +95,28 @@ impl VtfTable {
         }
 
         Ok(count)
+    }
+
+    fn check_unique_for_update(
+        &self,
+        col_name: &str,
+        new_val: &Value,
+        updating_indices: &HashSet<usize>,
+    ) -> VtfResult<()> {
+        let col_data = &self.data[col_name];
+        for i in 0..self.row_count {
+            if updating_indices.contains(&i) {
+                continue;
+            }
+            let existing = col_data.get_json_value(i).unwrap_or(Value::Null);
+            if !existing.is_null() && values_match(&existing, new_val) {
+                return Err(VtfError::UniqueViolation {
+                    column: col_name.to_string(),
+                    value: format!("{new_val}"),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn check_pk_update_uniqueness(

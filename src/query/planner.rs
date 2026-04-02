@@ -56,18 +56,22 @@ pub enum Plan {
 
 impl VtfTable {
     /// Given an AST expression, produce an optimized execution plan
-    /// that uses indexes when available.
+    /// that uses indexes when available and selectivity makes them worthwhile.
     pub fn plan_query(&self, expr: &Expr) -> Plan {
         match expr {
             Expr::Eq { column, value } => {
                 if let Some(idx) = self.indexes.get(column) {
-                    match idx.index_type {
-                        IndexType::Hash | IndexType::Sorted => {
-                            return Plan::HashIndexLookup {
-                                column: column.clone(),
-                                value: value.clone(),
-                            };
-                        }
+                    let key = value_to_plan_key(value);
+                    let hit_count = idx.map.get(&key).map(|v| v.len()).unwrap_or(0);
+                    // Only use the index if it is selective enough.
+                    // If >30% of rows match, a full scan avoids the indirection cost.
+                    let total = self.row_count.max(1);
+                    let selectivity = hit_count as f64 / total as f64;
+                    if selectivity < 0.30 {
+                        return Plan::HashIndexLookup {
+                            column: column.clone(),
+                            value: value.clone(),
+                        };
                     }
                 }
                 Plan::ColumnScan { expr: expr.clone() }

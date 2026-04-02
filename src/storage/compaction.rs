@@ -42,8 +42,8 @@ pub fn load_with_wal(vtf_path: &Path) -> VtfResult<VtfTable> {
     Ok(table)
 }
 
-/// Save a mutation to the WAL. If the WAL exceeds the compaction
-/// threshold, automatically compact.
+/// Save a mutation to the WAL and increment the table's LSN.
+/// If the WAL exceeds the compaction threshold, automatically compact.
 pub fn save_with_wal(
     vtf_path: &Path,
     entry: &wal::WalEntry,
@@ -56,6 +56,7 @@ pub fn save_with_wal(
 
     Ok(())
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -165,12 +166,14 @@ mod tests {
         let mut vals = IndexMap::new();
         vals.insert("name".to_string(), json!("Robert"));
         save_with_wal(&vtf_path, &WalEntry::Update {
-            indices: vec![1],
+            filter: "id = 2".to_string(),
+            pk_values: vec![json!(2)],
             values: vals,
         }).unwrap();
 
         save_with_wal(&vtf_path, &WalEntry::Delete {
-            indices: vec![0],
+            filter: "id = 1".to_string(),
+            pk_values: vec![json!(1)],
         }).unwrap();
 
         let table = load_with_wal(&vtf_path).unwrap();

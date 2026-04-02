@@ -14,6 +14,12 @@ pub enum VtfError {
     #[error("primary key violation: duplicate value '{value}' in column '{column}'")]
     PrimaryKeyViolation { column: String, value: String },
 
+    #[error("unique constraint violation: duplicate value '{value}' in column '{column}'")]
+    UniqueViolation { column: String, value: String },
+
+    #[error("not null constraint: column '{column}' does not allow null values")]
+    NotNullViolation { column: String },
+
     #[error("insert error: {0}")]
     Insert(String),
 

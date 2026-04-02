@@ -50,6 +50,25 @@ impl VtfTable {
         if let Some(ref pk) = self.meta.primary_key {
             meta_obj.insert("primaryKey".to_string(), Value::String(pk.clone()));
         }
+        if !self.meta.unique_columns.is_empty() {
+            meta_obj.insert(
+                "uniqueColumns".to_string(),
+                Value::Array(self.meta.unique_columns.iter().map(|c| Value::String(c.clone())).collect()),
+            );
+        }
+        if !self.meta.not_null_columns.is_empty() {
+            meta_obj.insert(
+                "notNullColumns".to_string(),
+                Value::Array(self.meta.not_null_columns.iter().map(|c| Value::String(c.clone())).collect()),
+            );
+        }
+        if !self.meta.defaults.is_empty() {
+            let mut defaults_obj = serde_json::Map::new();
+            for (col_name, val) in &self.meta.defaults {
+                defaults_obj.insert(col_name.clone(), val.clone());
+            }
+            meta_obj.insert("defaults".to_string(), Value::Object(defaults_obj));
+        }
         obj.insert("meta".to_string(), Value::Object(meta_obj));
 
         let mut indexes_obj = serde_json::Map::new();
@@ -92,6 +111,8 @@ impl VtfTable {
         obj.insert("indexes".to_string(), Value::Object(indexes_obj));
 
         obj.insert("extensions".to_string(), self.extensions.clone());
+
+        obj.insert("lsn".to_string(), Value::Number(serde_json::Number::from(self.lsn)));
 
         Value::Object(obj)
     }

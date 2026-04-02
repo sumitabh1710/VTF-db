@@ -8,11 +8,24 @@ use crate::core::types;
 impl VtfTable {
     /// Insert a row atomically. Either all columns are updated, or none.
     pub fn insert(&mut self, row: IndexMap<String, Value>) -> VtfResult<()> {
+        // Apply defaults for any columns omitted from the row
+        let row = self.apply_row_defaults(row);
+
         self.validate_insert_keys(&row)?;
 
         for col in &self.columns {
             let val = &row[&col.name];
             types::validate_value(val, &col.col_type, &col.name, self.row_count)?;
+        }
+
+        // NOT NULL enforcement
+        let not_null = self.meta.not_null_columns.clone();
+        for col_name in &not_null {
+            if let Some(val) = row.get(col_name) {
+                if val.is_null() {
+                    return Err(VtfError::NotNullViolation { column: col_name.clone() });
+                }
+            }
         }
 
         if let Some(ref pk) = self.meta.primary_key {
@@ -23,6 +36,16 @@ impl VtfTable {
                 )));
             }
             self.check_pk_uniqueness(pk, pk_val)?;
+        }
+
+        // UNIQUE constraint enforcement
+        let unique_cols = self.meta.unique_columns.clone();
+        for col_name in &unique_cols {
+            if let Some(val) = row.get(col_name) {
+                if !val.is_null() {
+                    self.check_unique_constraint(col_name, val)?;
+                }
+            }
         }
 
         let new_row_idx = self.row_count;
@@ -60,6 +83,18 @@ impl VtfTable {
         Ok(())
     }
 
+    /// Apply default values for any columns that are missing from a row.
+    fn apply_row_defaults(&self, mut row: IndexMap<String, Value>) -> IndexMap<String, Value> {
+        for col in &self.columns {
+            if !row.contains_key(&col.name) {
+                if let Some(default_val) = self.meta.defaults.get(&col.name) {
+                    row.insert(col.name.clone(), default_val.clone());
+                }
+            }
+        }
+        row
+    }
+
     fn validate_insert_keys(&self, row: &IndexMap<String, Value>) -> VtfResult<()> {
         let col_names: std::collections::HashSet<&str> =
             self.columns.iter().map(|c| c.name.as_str()).collect();
@@ -73,6 +108,33 @@ impl VtfTable {
         for key in &row_keys {
             if !col_names.contains(key) {
                 return Err(VtfError::insert(format!("extra column '{key}'")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check that a value does not violate the UNIQUE constraint on a column.
+    pub fn check_unique_constraint(&self, col_name: &str, new_val: &Value) -> VtfResult<()> {
+        let col_data = &self.data[col_name];
+
+        if let Some(idx) = self.indexes.get(col_name) {
+            let key = value_to_key(new_val);
+            if idx.map.contains_key(&key) {
+                return Err(VtfError::UniqueViolation {
+                    column: col_name.to_string(),
+                    value: key,
+                });
+            }
+            return Ok(());
+        }
+
+        for i in 0..self.row_count {
+            let existing = col_data.get_json_value(i).unwrap_or(Value::Null);
+            if !existing.is_null() && values_equal(&existing, new_val) {
+                return Err(VtfError::UniqueViolation {
+                    column: col_name.to_string(),
+                    value: format!("{new_val}"),
+                });
             }
         }
         Ok(())
@@ -114,16 +176,32 @@ impl VtfTable {
         }
 
         let pk = self.meta.primary_key.clone();
+        let not_null_cols = self.meta.not_null_columns.clone();
+        let unique_cols = self.meta.unique_columns.clone();
 
         let mut all_appended: Vec<Vec<(String, AppendValue)>> = Vec::with_capacity(rows.len());
         let mut batch_pk_values: Vec<String> = Vec::new();
+        // Track unique values seen within this batch to catch intra-batch violations
+        let mut batch_unique_values: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
 
-        for (batch_idx, row) in rows.iter().enumerate() {
-            self.validate_insert_keys(row)?;
+        for (batch_idx, raw_row) in rows.into_iter().enumerate() {
+            // Apply defaults
+            let row = self.apply_row_defaults(raw_row);
+
+            self.validate_insert_keys(&row)?;
 
             for col in &self.columns {
                 let val = &row[&col.name];
                 types::validate_value(val, &col.col_type, &col.name, self.row_count + batch_idx)?;
+            }
+
+            // NOT NULL enforcement
+            for col_name in &not_null_cols {
+                if let Some(val) = row.get(col_name) {
+                    if val.is_null() {
+                        return Err(VtfError::NotNullViolation { column: col_name.clone() });
+                    }
+                }
             }
 
             if let Some(ref pk_col) = pk {
@@ -143,6 +221,24 @@ impl VtfTable {
                     });
                 }
                 batch_pk_values.push(key);
+            }
+
+            // UNIQUE constraint enforcement (against committed data + within batch)
+            for col_name in &unique_cols {
+                if let Some(val) = row.get(col_name) {
+                    if !val.is_null() {
+                        self.check_unique_constraint(col_name, val)?;
+                        let key = value_to_key(val);
+                        let batch_seen = batch_unique_values.entry(col_name.clone()).or_default();
+                        if batch_seen.contains(&key) {
+                            return Err(VtfError::UniqueViolation {
+                                column: col_name.clone(),
+                                value: key,
+                            });
+                        }
+                        batch_seen.push(key);
+                    }
+                }
             }
 
             let mut row_values = Vec::with_capacity(self.columns.len());
@@ -386,5 +482,95 @@ mod tests {
         row.insert("name".to_string(), Value::Null);
         assert!(table.insert(row).is_ok());
         assert_eq!(table.row_count, 1);
+    }
+
+    #[test]
+    fn test_not_null_rejects_null() {
+        let mut table = test_table();
+        table.meta.not_null_columns = vec!["name".to_string()];
+        let mut row = IndexMap::new();
+        row.insert("id".to_string(), serde_json::json!(1));
+        row.insert("name".to_string(), Value::Null);
+        assert!(table.insert(row).is_err());
+    }
+
+    #[test]
+    fn test_not_null_allows_value() {
+        let mut table = test_table();
+        table.meta.not_null_columns = vec!["name".to_string()];
+        let mut row = IndexMap::new();
+        row.insert("id".to_string(), serde_json::json!(1));
+        row.insert("name".to_string(), serde_json::json!("Alice"));
+        assert!(table.insert(row).is_ok());
+    }
+
+    #[test]
+    fn test_unique_rejects_duplicate() {
+        let mut table = test_table();
+        table.meta.unique_columns = vec!["name".to_string()];
+        let mut row1 = IndexMap::new();
+        row1.insert("id".to_string(), serde_json::json!(1));
+        row1.insert("name".to_string(), serde_json::json!("Alice"));
+        table.insert(row1).unwrap();
+
+        let mut row2 = IndexMap::new();
+        row2.insert("id".to_string(), serde_json::json!(2));
+        row2.insert("name".to_string(), serde_json::json!("Alice"));
+        assert!(table.insert(row2).is_err());
+    }
+
+    #[test]
+    fn test_unique_allows_distinct_values() {
+        let mut table = test_table();
+        table.meta.unique_columns = vec!["name".to_string()];
+        let mut row1 = IndexMap::new();
+        row1.insert("id".to_string(), serde_json::json!(1));
+        row1.insert("name".to_string(), serde_json::json!("Alice"));
+        table.insert(row1).unwrap();
+
+        let mut row2 = IndexMap::new();
+        row2.insert("id".to_string(), serde_json::json!(2));
+        row2.insert("name".to_string(), serde_json::json!("Bob"));
+        assert!(table.insert(row2).is_ok());
+    }
+
+    #[test]
+    fn test_unique_allows_multiple_nulls() {
+        let mut table = test_table();
+        table.meta.unique_columns = vec!["name".to_string()];
+        for i in 1..=3 {
+            let mut row = IndexMap::new();
+            row.insert("id".to_string(), serde_json::json!(i));
+            row.insert("name".to_string(), Value::Null);
+            assert!(table.insert(row).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_default_applied_when_column_missing() {
+        let mut table = test_table();
+        table.meta.defaults.insert("name".to_string(), serde_json::json!("Unknown"));
+        let mut row = IndexMap::new();
+        row.insert("id".to_string(), serde_json::json!(1));
+        // name is missing — should use default "Unknown"
+        assert!(table.insert(row).is_ok());
+        let rows = table.select_rows(&[0], &[]).unwrap();
+        assert_eq!(rows[0]["name"], serde_json::json!("Unknown"));
+    }
+
+    #[test]
+    fn test_schema_constraints_roundtrip_json() {
+        let mut table = test_table();
+        table.meta.unique_columns = vec!["name".to_string()];
+        table.meta.not_null_columns = vec!["name".to_string()];
+        table.meta.defaults.insert("name".to_string(), serde_json::json!("default"));
+
+        let json = table.to_json().unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let loaded = crate::storage::validation::validate_and_build(raw).unwrap();
+
+        assert_eq!(loaded.meta.unique_columns, vec!["name"]);
+        assert_eq!(loaded.meta.not_null_columns, vec!["name"]);
+        assert_eq!(loaded.meta.defaults.get("name"), Some(&serde_json::json!("default")));
     }
 }
