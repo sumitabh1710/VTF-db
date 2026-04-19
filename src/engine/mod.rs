@@ -3,3 +3,4 @@ pub mod delete;
 pub mod update;
 pub mod schema;
 pub mod transaction;
+pub mod join;

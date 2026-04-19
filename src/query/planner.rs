@@ -47,34 +47,61 @@ pub enum Plan {
     /// Full column scan with a predicate
     ColumnScan { expr: Expr },
     /// Intersection of two plans (AND)
-    Intersect(Box<Plan>, Box<Plan>),
+    Intersect(Box<PlanNode>, Box<PlanNode>),
     /// Union of two plans (OR)
-    Union(Box<Plan>, Box<Plan>),
+    Union(Box<PlanNode>, Box<PlanNode>),
     /// Complement of a plan (NOT) against total row set
-    Complement(Box<Plan>),
+    Complement(Box<PlanNode>),
+}
+
+/// A plan enriched with cost estimates. All plan-related code returns `PlanNode`
+/// rather than bare `Plan` so that `EXPLAIN` and the executor have access to
+/// estimated cardinalities without a separate pass.
+#[derive(Debug, Clone)]
+pub struct PlanNode {
+    pub plan: Plan,
+    /// Estimated number of rows this node will produce.
+    pub estimated_rows: usize,
+    /// Estimated cost in abstract units (lower is cheaper).
+    pub cost: f64,
+}
+
+impl PlanNode {
+    fn new(plan: Plan, estimated_rows: usize, cost: f64) -> Self {
+        PlanNode { plan, estimated_rows, cost }
+    }
 }
 
 impl VtfTable {
-    /// Given an AST expression, produce an optimized execution plan
-    /// that uses indexes when available and selectivity makes them worthwhile.
-    pub fn plan_query(&self, expr: &Expr) -> Plan {
+    /// Given an AST expression, produce a cost-estimated execution plan.
+    /// Uses column statistics when valid; falls back to heuristic estimates
+    /// (30% selectivity rule) when stats are absent or stale.
+    pub fn plan_query(&self, expr: &Expr) -> PlanNode {
+        let total = self.row_count.max(1);
+
         match expr {
             Expr::Eq { column, value } => {
                 if let Some(idx) = self.indexes.get(column) {
                     let key = value_to_plan_key(value);
                     let hit_count = idx.map.get(&key).map(|v| v.len()).unwrap_or(0);
-                    // Only use the index if it is selective enough.
-                    // If >30% of rows match, a full scan avoids the indirection cost.
-                    let total = self.row_count.max(1);
-                    let selectivity = hit_count as f64 / total as f64;
-                    if selectivity < 0.30 {
-                        return Plan::HashIndexLookup {
-                            column: column.clone(),
-                            value: value.clone(),
-                        };
+                    // Cost model: hash lookup = number of matching rows (no traversal overhead).
+                    // Scan cost = total rows (must read all).
+                    let hash_cost = hit_count as f64 + 1.0; // +1 for the map lookup
+                    let scan_cost = total as f64;
+                    if hash_cost < scan_cost {
+                        return PlanNode::new(
+                            Plan::HashIndexLookup { column: column.clone(), value: value.clone() },
+                            hit_count,
+                            hash_cost,
+                        );
                     }
                 }
-                Plan::ColumnScan { expr: expr.clone() }
+                let est_rows = self.estimate_eq_rows(column, value);
+                PlanNode::new(
+                    Plan::ColumnScan { expr: expr.clone() },
+                    est_rows,
+                    total as f64,
+                )
             }
 
             Expr::Gt { column, value } => self.plan_range(column, value, false, false),
@@ -82,64 +109,134 @@ impl VtfTable {
             Expr::Lt { column, value } => self.plan_range(column, value, true, false),
             Expr::Lte { column, value } => self.plan_range(column, value, true, true),
 
-            Expr::Neq { .. } | Expr::Not(_) => {
-                match expr {
-                    Expr::Not(inner) => Plan::Complement(Box::new(self.plan_query(inner))),
-                    _ => Plan::ColumnScan { expr: expr.clone() },
-                }
+            Expr::Neq { .. } => {
+                let est = total.saturating_sub(self.estimate_eq_rows_from_neq(expr));
+                PlanNode::new(Plan::ColumnScan { expr: expr.clone() }, est, total as f64)
+            }
+
+            Expr::Not(inner) => {
+                let inner_node = self.plan_query(inner);
+                let est = total.saturating_sub(inner_node.estimated_rows);
+                let cost = inner_node.cost + total as f64 * 0.01; // small complement pass cost
+                PlanNode::new(Plan::Complement(Box::new(inner_node)), est, cost)
             }
 
             Expr::And(left, right) => {
                 let lp = self.plan_query(left);
                 let rp = self.plan_query(right);
-                Plan::Intersect(Box::new(lp), Box::new(rp))
+                // Intersection estimate: min of the two (conservative)
+                let est = lp.estimated_rows.min(rp.estimated_rows);
+                let cost = lp.cost + rp.cost;
+                PlanNode::new(Plan::Intersect(Box::new(lp), Box::new(rp)), est, cost)
             }
 
             Expr::Or(left, right) => {
                 let lp = self.plan_query(left);
                 let rp = self.plan_query(right);
-                Plan::Union(Box::new(lp), Box::new(rp))
+                let est = (lp.estimated_rows + rp.estimated_rows).min(total);
+                let cost = lp.cost + rp.cost;
+                PlanNode::new(Plan::Union(Box::new(lp), Box::new(rp)), est, cost)
             }
         }
     }
 
-    fn plan_range(&self, column: &str, value: &serde_json::Value, is_less: bool, inclusive: bool) -> Plan {
+    fn plan_range(&self, column: &str, value: &serde_json::Value, is_less: bool, inclusive: bool) -> PlanNode {
+        let total = self.row_count.max(1);
+
         if let Some(idx) = self.indexes.get(column) {
             if idx.sorted_keys.is_some() {
                 let key = value_to_plan_key(value);
-                return if is_less {
-                    Plan::SortedIndexRange {
-                        column: column.to_string(),
-                        low: None,
-                        high: Some(key),
-                        low_inclusive: true,
-                        high_inclusive: inclusive,
-                    }
+                let est = self.estimate_range_rows(column, value, is_less);
+                let distinct = idx.sorted_keys.as_ref().map(|k| k.len()).unwrap_or(1).max(1);
+                // Range cost: matched rows + log2(distinct) for tree traversal
+                let range_cost = est as f64 + (distinct as f64).log2();
+                let (low, high, low_inclusive, high_inclusive) = if is_less {
+                    (None, Some(key), true, inclusive)
                 } else {
-                    Plan::SortedIndexRange {
-                        column: column.to_string(),
-                        low: Some(key),
-                        high: None,
-                        low_inclusive: inclusive,
-                        high_inclusive: true,
-                    }
+                    (Some(key), None, inclusive, true)
                 };
+                return PlanNode::new(
+                    Plan::SortedIndexRange { column: column.to_string(), low, high, low_inclusive, high_inclusive },
+                    est,
+                    range_cost,
+                );
             }
         }
-        Plan::ColumnScan {
-            expr: if is_less {
-                if inclusive {
-                    Expr::Lte { column: column.to_string(), value: value.clone() }
-                } else {
-                    Expr::Lt { column: column.to_string(), value: value.clone() }
-                }
-            } else if inclusive {
-                Expr::Gte { column: column.to_string(), value: value.clone() }
+
+        let est = self.estimate_range_rows(column, value, is_less);
+        let scan_expr = if is_less {
+            if inclusive {
+                Expr::Lte { column: column.to_string(), value: value.clone() }
             } else {
-                Expr::Gt { column: column.to_string(), value: value.clone() }
-            },
+                Expr::Lt { column: column.to_string(), value: value.clone() }
+            }
+        } else if inclusive {
+            Expr::Gte { column: column.to_string(), value: value.clone() }
+        } else {
+            Expr::Gt { column: column.to_string(), value: value.clone() }
+        };
+        PlanNode::new(Plan::ColumnScan { expr: scan_expr }, est, total as f64)
+    }
+
+    /// Estimate how many rows match `column = value`.
+    fn estimate_eq_rows(&self, column: &str, value: &serde_json::Value) -> usize {
+        let total = self.row_count.max(1);
+        // If we have a live index, read the hit count directly.
+        if let Some(idx) = self.indexes.get(column) {
+            let key = value_to_plan_key(value);
+            return idx.map.get(&key).map(|v| v.len()).unwrap_or(0);
+        }
+        // Use valid stats: rows / distinct_count
+        if let Some(s) = self.stats.get(column) {
+            if s.valid && s.distinct_count > 0 {
+                return total / s.distinct_count;
+            }
+        }
+        // Fallback: 30% selectivity
+        (total as f64 * 0.30) as usize
+    }
+
+    fn estimate_eq_rows_from_neq(&self, expr: &Expr) -> usize {
+        if let Expr::Neq { column, value } = expr {
+            self.estimate_eq_rows(column, value)
+        } else {
+            0
         }
     }
+
+    /// Estimate how many rows satisfy a range bound using column stats.
+    fn estimate_range_rows(&self, column: &str, value: &serde_json::Value, is_less: bool) -> usize {
+        let total = self.row_count.max(1);
+        if let Some(s) = self.stats.get(column) {
+            if s.valid {
+                if let (Some(min_v), Some(max_v)) = (&s.min, &s.max) {
+                    if let Some(sel) = range_selectivity(min_v, max_v, value, is_less) {
+                        return ((total as f64) * sel) as usize;
+                    }
+                }
+            }
+        }
+        // Fallback: assume half the rows
+        total / 2
+    }
+}
+
+/// Estimate fraction of values below (or above) `bound` given [min, max].
+fn range_selectivity(
+    min: &serde_json::Value,
+    max: &serde_json::Value,
+    bound: &serde_json::Value,
+    is_less: bool,
+) -> Option<f64> {
+    let mn = min.as_f64()?;
+    let mx = max.as_f64()?;
+    let b = bound.as_f64()?;
+    let span = mx - mn;
+    if span <= 0.0 {
+        return Some(if is_less { 1.0 } else { 0.0 });
+    }
+    let frac = ((b - mn) / span).clamp(0.0, 1.0);
+    Some(if is_less { frac } else { 1.0 - frac })
 }
 
 fn value_to_plan_key(val: &serde_json::Value) -> String {
@@ -152,8 +249,12 @@ fn value_to_plan_key(val: &serde_json::Value) -> String {
     }
 }
 
-/// Execute a plan against a table, returning matching row indices.
-pub fn execute(table: &VtfTable, plan: &Plan) -> VtfResult<Vec<usize>> {
+/// Execute a plan node against a table, returning matching row indices.
+pub fn execute(table: &VtfTable, node: &PlanNode) -> VtfResult<Vec<usize>> {
+    execute_plan(table, &node.plan)
+}
+
+fn execute_plan(table: &VtfTable, plan: &Plan) -> VtfResult<Vec<usize>> {
     use std::collections::HashSet;
 
     match plan {
@@ -232,9 +333,9 @@ mod tests {
         let mut table = test_table();
         table.create_index("name", IndexType::Hash).unwrap();
         let expr = Expr::Eq { column: "name".to_string(), value: json!("Alice") };
-        let plan = table.plan_query(&expr);
-        assert!(matches!(plan, Plan::HashIndexLookup { .. }));
-        let result = execute(&table, &plan).unwrap();
+        let node = table.plan_query(&expr);
+        assert!(matches!(node.plan, Plan::HashIndexLookup { .. }));
+        let result = execute(&table, &node).unwrap();
         assert_eq!(result, vec![0]);
     }
 
@@ -243,9 +344,9 @@ mod tests {
         let mut table = test_table();
         table.create_index("age", IndexType::Sorted).unwrap();
         let expr = Expr::Gt { column: "age".to_string(), value: json!(28) };
-        let plan = table.plan_query(&expr);
-        assert!(matches!(plan, Plan::SortedIndexRange { .. }));
-        let result = execute(&table, &plan).unwrap();
+        let node = table.plan_query(&expr);
+        assert!(matches!(node.plan, Plan::SortedIndexRange { .. }));
+        let result = execute(&table, &node).unwrap();
         assert_eq!(result, vec![0, 2]); // Alice(30), Charlie(35)
     }
 
@@ -253,9 +354,9 @@ mod tests {
     fn plan_falls_back_to_scan_without_index() {
         let table = test_table();
         let expr = Expr::Gt { column: "age".to_string(), value: json!(28) };
-        let plan = table.plan_query(&expr);
-        assert!(matches!(plan, Plan::ColumnScan { .. }));
-        let result = execute(&table, &plan).unwrap();
+        let node = table.plan_query(&expr);
+        assert!(matches!(node.plan, Plan::ColumnScan { .. }));
+        let result = execute(&table, &node).unwrap();
         assert_eq!(result, vec![0, 2]); // same result via scan
     }
 
@@ -267,9 +368,9 @@ mod tests {
             Box::new(Expr::Gt { column: "age".to_string(), value: json!(24) }),
             Box::new(Expr::Lt { column: "age".to_string(), value: json!(31) }),
         );
-        let plan = table.plan_query(&expr);
-        assert!(matches!(plan, Plan::Intersect(_, _)));
-        let result = execute(&table, &plan).unwrap();
+        let node = table.plan_query(&expr);
+        assert!(matches!(node.plan, Plan::Intersect(_, _)));
+        let result = execute(&table, &node).unwrap();
         // age > 24 AND age < 31: Bob(25), Dave(28), Alice(30)
         assert_eq!(result, vec![0, 1, 3]);
     }
@@ -281,9 +382,9 @@ mod tests {
             Box::new(Expr::Eq { column: "name".to_string(), value: json!("Alice") }),
             Box::new(Expr::Eq { column: "name".to_string(), value: json!("Eve") }),
         );
-        let plan = table.plan_query(&expr);
-        assert!(matches!(plan, Plan::Union(_, _)));
-        let result = execute(&table, &plan).unwrap();
+        let node = table.plan_query(&expr);
+        assert!(matches!(node.plan, Plan::Union(_, _)));
+        let result = execute(&table, &node).unwrap();
         assert_eq!(result, vec![0, 4]);
     }
 
@@ -293,9 +394,9 @@ mod tests {
         let expr = Expr::Not(
             Box::new(Expr::Eq { column: "name".to_string(), value: json!("Alice") }),
         );
-        let plan = table.plan_query(&expr);
-        assert!(matches!(plan, Plan::Complement(_)));
-        let result = execute(&table, &plan).unwrap();
+        let node = table.plan_query(&expr);
+        assert!(matches!(node.plan, Plan::Complement(_)));
+        let result = execute(&table, &node).unwrap();
         assert_eq!(result, vec![1, 2, 3, 4]);
     }
 
@@ -312,8 +413,8 @@ mod tests {
                 Box::new(Expr::Eq { column: "name".to_string(), value: json!("Charlie") }),
             )),
         );
-        let plan = table.plan_query(&expr);
-        let result = execute(&table, &plan).unwrap();
+        let node = table.plan_query(&expr);
+        let result = execute(&table, &node).unwrap();
         // age >= 30: Alice(0), Charlie(2). name=Bob: Bob(1). Union: {0,1,2}
         // NOT Charlie: {0,1,3,4}. Intersect: {0,1}
         assert_eq!(result, vec![0, 1]);
@@ -323,8 +424,8 @@ mod tests {
     fn execute_via_parser_and_planner() {
         let table = test_table();
         let expr = crate::query::parser::parse("age > 25 AND age <= 30").unwrap();
-        let plan = table.plan_query(&expr);
-        let result = execute(&table, &plan).unwrap();
+        let node = table.plan_query(&expr);
+        let result = execute(&table, &node).unwrap();
         // age > 25: Alice(30), Charlie(35), Dave(28) -> {0,2,3}
         // age <= 30: Alice(30), Bob(25), Dave(28), Eve(22) -> {0,1,3,4}
         // Intersect: {0,3}
@@ -350,5 +451,30 @@ mod tests {
         let cols = required_columns(&expr);
         assert_eq!(cols.len(), 1);
         assert!(cols.contains("status"));
+    }
+
+    #[test]
+    fn plan_node_has_cost_and_estimated_rows() {
+        let mut table = test_table();
+        table.create_index("name", IndexType::Hash).unwrap();
+        let expr = Expr::Eq { column: "name".to_string(), value: json!("Alice") };
+        let node = table.plan_query(&expr);
+        // Cost must be positive
+        assert!(node.cost > 0.0);
+        // Estimated rows must be <= row_count
+        assert!(node.estimated_rows <= table.row_count);
+    }
+
+    #[test]
+    fn cost_model_prefers_index_over_scan() {
+        let mut table = test_table();
+        table.create_index("id", IndexType::Hash).unwrap();
+        // id=1 is very selective (1 row out of 5)
+        let expr = Expr::Eq { column: "id".to_string(), value: json!(1) };
+        let node = table.plan_query(&expr);
+        assert!(matches!(node.plan, Plan::HashIndexLookup { .. }),
+            "expected hash lookup for selective eq, got {:?}", node.plan);
+        assert!(node.cost < table.row_count as f64,
+            "index cost should be less than full scan cost");
     }
 }

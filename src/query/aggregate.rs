@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 use crate::core::error::{VtfError, VtfResult};
@@ -98,6 +100,48 @@ pub fn max_val(col: &ColumnData, indices: Option<&[usize]>) -> VtfResult<Value> 
         }
         _ => Err(VtfError::query("max() requires int, float, string, or date column")),
     }
+}
+
+/// Compute statistics for a single column.
+/// Returns a valid `ColumnStats` reflecting the current state of `col`.
+pub fn compute_stats(col: &ColumnData) -> VtfResult<ColumnStats> {
+    let total = col.len();
+    let null_count = (0..total).filter(|&i| is_null(col, i)).count();
+    let row_count = total;
+
+    // Distinct count via key set (exact, acceptable for now)
+    let distinct_count = match col {
+        ColumnData::Int(v) => {
+            let seen: HashSet<_> = v.iter().filter_map(|x| *x).collect();
+            seen.len()
+        }
+        ColumnData::Float(v) => {
+            // Use bit pattern for f64 distinctness (NaN treated as a single value)
+            let seen: HashSet<u64> = v.iter().filter_map(|x| x.map(|f| f.to_bits())).collect();
+            seen.len()
+        }
+        ColumnData::Str(v) | ColumnData::Date(v) => {
+            let seen: HashSet<_> = v.iter().filter_map(|x| x.as_deref()).collect();
+            seen.len()
+        }
+        ColumnData::Bool(v) => {
+            let seen: HashSet<_> = v.iter().filter_map(|x| *x).collect();
+            seen.len()
+        }
+        _ => 0, // array columns have no meaningful distinct count
+    };
+
+    let min = min_val(col, None).ok();
+    let max = max_val(col, None).ok();
+
+    Ok(ColumnStats {
+        row_count,
+        null_count,
+        distinct_count,
+        min: min.filter(|v| !v.is_null()),
+        max: max.filter(|v| !v.is_null()),
+        valid: true,
+    })
 }
 
 fn is_null(col: &ColumnData, idx: usize) -> bool {

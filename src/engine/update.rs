@@ -90,6 +90,8 @@ impl VtfTable {
             }
         }
 
+        self.invalidate_stats();
+
         if !self.indexes.is_empty() {
             self.rebuild_indexes()?;
         }

@@ -63,6 +63,7 @@ impl VtfTable {
         }
 
         self.row_count += 1;
+        self.invalidate_stats();
 
         for (col_name, idx) in self.indexes.iter_mut() {
             let col_data = &self.data[col_name];
@@ -73,7 +74,12 @@ impl VtfTable {
                     .push(new_row_idx);
 
                 if let Some(ref mut sorted_keys) = idx.sorted_keys {
-                    if let Err(pos) = sorted_keys.binary_search(&key) {
+                    let col_type = &idx.column_type;
+                    let pos = sorted_keys.partition_point(|k| {
+                        crate::index::sorted::key_cmp(k, &key, col_type)
+                            == std::cmp::Ordering::Less
+                    });
+                    if sorted_keys.get(pos).map(|k| k.as_str()) != Some(key.as_str()) {
                         sorted_keys.insert(pos, key);
                     }
                 }
@@ -261,6 +267,7 @@ impl VtfTable {
         }
 
         self.row_count += count;
+        self.invalidate_stats();
 
         for new_row_offset in 0..count {
             let new_row_idx = start_idx + new_row_offset;
@@ -273,7 +280,12 @@ impl VtfTable {
                         .push(new_row_idx);
 
                     if let Some(ref mut sorted_keys) = idx.sorted_keys {
-                        if let Err(pos) = sorted_keys.binary_search(&key) {
+                        let col_type = &idx.column_type;
+                        let pos = sorted_keys.partition_point(|k| {
+                            crate::index::sorted::key_cmp(k, &key, col_type)
+                                == std::cmp::Ordering::Less
+                        });
+                        if sorted_keys.get(pos).map(|k| k.as_str()) != Some(key.as_str()) {
                             sorted_keys.insert(pos, key);
                         }
                     }

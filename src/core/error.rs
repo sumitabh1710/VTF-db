@@ -34,6 +34,12 @@ pub enum VtfError {
 
     #[error("schema: {0}")]
     Schema(String),
+
+    /// Optimistic concurrency conflict: the table was modified by another
+    /// writer between the time this transaction started and commit time.
+    /// The caller should re-read the data and retry the transaction.
+    #[error("OCC conflict: table LSN {current_lsn} != transaction read LSN {read_lsn}; retry the transaction")]
+    OccConflict { read_lsn: u64, current_lsn: u64 },
 }
 
 pub type VtfResult<T> = Result<T, VtfError>;

@@ -33,6 +33,19 @@ pub fn euclidean_distance(a: &[f64], b: &[f64]) -> f64 {
     sum.sqrt()
 }
 
+/// Brute-force top-K cosine similarity search returning `(row_idx, similarity)` as f32.
+/// Used as the HNSW fallback path.
+pub fn top_k_cosine_rows(
+    table: &VtfTable,
+    column: &str,
+    query: &[f32],
+    k: usize,
+) -> crate::core::error::VtfResult<Vec<(usize, f32)>> {
+    let query_f64: Vec<f64> = query.iter().map(|&x| x as f64).collect();
+    let results = top_k(table, column, &query_f64, k, Metric::Cosine)?;
+    Ok(results.into_iter().map(|(i, s)| (i, s as f32)).collect())
+}
+
 /// Brute-force top-K search over an `array<float>` column.
 /// Returns `(row_index, score)` pairs sorted best-first:
 ///   - Cosine: highest similarity first

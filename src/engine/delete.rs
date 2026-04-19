@@ -30,6 +30,7 @@ impl VtfTable {
         }
 
         self.row_count -= count;
+        self.invalidate_stats();
 
         if !self.indexes.is_empty() {
             self.rebuild_indexes()?;

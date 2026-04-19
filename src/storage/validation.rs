@@ -36,6 +36,12 @@ pub fn validate_and_build(raw: Value) -> VtfResult<VtfTable> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
+    let stats = parse_stats(obj, &columns);
+
+    // Vector indexes (HNSW graphs) are persisted in the extensions blob.
+    // Load them back if available; they do not affect correctness — only performance.
+    let vector_indexes = load_vector_indexes_from_extensions(&extensions);
+
     Ok(VtfTable {
         version,
         columns,
@@ -45,6 +51,8 @@ pub fn validate_and_build(raw: Value) -> VtfResult<VtfTable> {
         indexes,
         extensions,
         lsn,
+        stats,
+        vector_indexes,
     })
 }
 
@@ -566,11 +574,20 @@ fn validate_indexes(
             None
         };
 
+        // Determine the column type for type-aware index operations.
+        // Prefer the persisted "columnType" field; fall back to the schema column type.
+        let column_type = if let Some(ct_val) = idx_obj.get("columnType").and_then(|v| v.as_str()) {
+            ColumnType::from_str(ct_val).unwrap_or_else(|_| col.col_type.clone())
+        } else {
+            col.col_type.clone()
+        };
+
         result.insert(
             col_name.clone(),
             IndexDef {
                 column: col_name.clone(),
                 index_type,
+                column_type,
                 map,
                 sorted_keys,
             },
@@ -578,6 +595,63 @@ fn validate_indexes(
     }
 
     Ok(result)
+}
+
+/// Public wrapper for use by the binary decoder.
+pub fn load_vector_indexes_from_extensions_pub(
+    extensions: &Value,
+) -> IndexMap<String, crate::index::hnsw::HnswGraph> {
+    load_vector_indexes_from_extensions(extensions)
+}
+
+fn load_vector_indexes_from_extensions(
+    extensions: &Value,
+) -> IndexMap<String, crate::index::hnsw::HnswGraph> {
+    let mut result = IndexMap::new();
+    let vi_obj = match extensions
+        .get("vectorIndexes")
+        .and_then(|v| v.as_object())
+    {
+        Some(o) => o,
+        None => return result,
+    };
+    for (col_name, blob_val) in vi_obj {
+        if let Some(blob) = blob_val.as_str() {
+            match crate::index::hnsw::HnswGraph::from_json_blob(blob) {
+                Ok(graph) => { result.insert(col_name.clone(), graph); }
+                Err(_) => { /* ignore corrupted blobs */ }
+            }
+        }
+    }
+    result
+}
+
+fn parse_stats(
+    obj: &serde_json::Map<String, Value>,
+    columns: &[Column],
+) -> IndexMap<String, ColumnStats> {
+    let mut result = IndexMap::new();
+    let stats_val = match obj.get("stats") {
+        Some(v) => v,
+        None => return result,
+    };
+    let stats_obj = match stats_val.as_object() {
+        Some(o) => o,
+        None => return result,
+    };
+
+    for col in columns {
+        if let Some(s) = stats_obj.get(&col.name).and_then(|v| v.as_object()) {
+            let valid = s.get("valid").and_then(|v| v.as_bool()).unwrap_or(false);
+            let row_count = s.get("rowCount").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let null_count = s.get("nullCount").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let distinct_count = s.get("distinctCount").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let min = s.get("min").cloned().filter(|v| !v.is_null());
+            let max = s.get("max").cloned().filter(|v| !v.is_null());
+            result.insert(col.name.clone(), ColumnStats { valid, row_count, null_count, distinct_count, min, max });
+        }
+    }
+    result
 }
 
 #[cfg(test)]

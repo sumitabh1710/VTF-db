@@ -74,6 +74,8 @@ impl VtfTable {
         let mut indexes_obj = serde_json::Map::new();
         for (col_name, idx) in &self.indexes {
             let mut idx_obj = serde_json::Map::new();
+            // Persist the column type so range queries can use type-aware comparison on reload.
+            idx_obj.insert("columnType".to_string(), Value::String(idx.column_type.as_str().to_string()));
             match &idx.index_type {
                 IndexType::Hash => {
                     idx_obj.insert("type".to_string(), Value::String("hash".to_string()));
@@ -110,9 +112,42 @@ impl VtfTable {
         }
         obj.insert("indexes".to_string(), Value::Object(indexes_obj));
 
-        obj.insert("extensions".to_string(), self.extensions.clone());
+        // Merge vector indexes into extensions blob before saving.
+        let mut extensions = self.extensions.clone();
+        if !self.vector_indexes.is_empty() {
+            let mut vi_map = serde_json::Map::new();
+            for (col_name, graph) in &self.vector_indexes {
+                if let Ok(blob) = graph.to_json_blob() {
+                    vi_map.insert(col_name.clone(), serde_json::Value::String(blob));
+                }
+            }
+            if let serde_json::Value::Object(ref mut ext_inner) = extensions {
+                ext_inner.insert("vectorIndexes".to_string(), serde_json::Value::Object(vi_map));
+            } else {
+                // extensions was not an object; replace it with a fresh object.
+                let mut new_ext = serde_json::Map::new();
+                new_ext.insert("vectorIndexes".to_string(), serde_json::Value::Object(vi_map));
+                extensions = serde_json::Value::Object(new_ext);
+            }
+        }
+        obj.insert("extensions".to_string(), extensions);
 
         obj.insert("lsn".to_string(), Value::Number(serde_json::Number::from(self.lsn)));
+
+        if !self.stats.is_empty() {
+            let mut stats_obj = serde_json::Map::new();
+            for (col_name, s) in &self.stats {
+                let mut s_obj = serde_json::Map::new();
+                s_obj.insert("valid".to_string(), Value::Bool(s.valid));
+                s_obj.insert("rowCount".to_string(), Value::from(s.row_count as u64));
+                s_obj.insert("nullCount".to_string(), Value::from(s.null_count as u64));
+                s_obj.insert("distinctCount".to_string(), Value::from(s.distinct_count as u64));
+                s_obj.insert("min".to_string(), s.min.clone().unwrap_or(Value::Null));
+                s_obj.insert("max".to_string(), s.max.clone().unwrap_or(Value::Null));
+                stats_obj.insert(col_name.clone(), Value::Object(s_obj));
+            }
+            obj.insert("stats".to_string(), Value::Object(stats_obj));
+        }
 
         Value::Object(obj)
     }

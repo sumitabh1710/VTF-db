@@ -178,4 +178,35 @@ pub enum Commands {
         #[arg(long, name = "type")]
         index_type: String,
     },
+    /// Compute and persist column statistics used by the query planner
+    Analyze {
+        /// VTF file path
+        file: PathBuf,
+    },
+    /// Check index consistency: verify stored indexes match actual data
+    Check {
+        /// VTF file path
+        file: PathBuf,
+    },
+    /// Join two tables on a shared column using a hash join
+    Join {
+        /// Left table VTF file path
+        left: PathBuf,
+        /// Right table VTF file path
+        right: PathBuf,
+        /// Join condition as "left_col=right_col"
+        #[arg(long)]
+        on: String,
+        /// Output file path (prints to stdout if omitted)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Build a vector (HNSW) index on an array<float> column for fast approximate search
+    BuildVectorIndex {
+        /// VTF file path
+        file: PathBuf,
+        /// Column containing embeddings (must be array<float>)
+        #[arg(long)]
+        column: String,
+    },
 }

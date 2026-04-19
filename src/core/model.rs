@@ -248,7 +248,7 @@ pub struct Meta {
     pub defaults: IndexMap<std::string::String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum IndexType {
     Hash,
     Sorted,
@@ -258,9 +258,49 @@ pub enum IndexType {
 pub struct IndexDef {
     pub column: std::string::String,
     pub index_type: IndexType,
+    /// The type of the indexed column, used for type-aware sort-key comparison.
+    pub column_type: ColumnType,
     pub map: HashMap<std::string::String, Vec<usize>>,
-    /// Only used for sorted indexes: sorted key order
+    /// Only used for sorted indexes: sorted key order (always in type-aware ascending order)
     pub sorted_keys: Option<Vec<std::string::String>>,
+}
+
+impl PartialEq for IndexDef {
+    fn eq(&self, other: &Self) -> bool {
+        self.column == other.column
+            && self.index_type == other.index_type
+            && self.column_type == other.column_type
+            && self.map == other.map
+            && self.sorted_keys == other.sorted_keys
+    }
+}
+
+/// Per-column statistics used by the cost-based query planner.
+/// Stats are considered valid only after an explicit `ANALYZE` operation.
+/// Any write (insert/update/delete) marks stats as stale (`valid = false`).
+#[derive(Debug, Clone)]
+pub struct ColumnStats {
+    pub row_count: usize,
+    pub null_count: usize,
+    /// Approximate number of distinct non-null values.
+    pub distinct_count: usize,
+    pub min: Option<serde_json::Value>,
+    pub max: Option<serde_json::Value>,
+    /// `false` means stats are stale and should not be trusted by the planner.
+    pub valid: bool,
+}
+
+impl ColumnStats {
+    pub fn invalid() -> Self {
+        ColumnStats {
+            row_count: 0,
+            null_count: 0,
+            distinct_count: 0,
+            min: None,
+            max: None,
+            valid: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +316,11 @@ pub struct VtfTable {
     /// Monotonically increasing; used as the foundation for optimistic
     /// concurrency control in future server mode.
     pub lsn: u64,
+    /// Per-column statistics populated by `ANALYZE`. Empty map means no stats collected yet.
+    pub stats: IndexMap<std::string::String, ColumnStats>,
+    /// HNSW approximate nearest-neighbor indexes for `array<float>` columns.
+    /// These are rebuilt offline via `vtf build-vector-index`.
+    pub vector_indexes: IndexMap<std::string::String, crate::index::hnsw::HnswGraph>,
 }
 
 impl VtfTable {
@@ -298,7 +343,26 @@ impl VtfTable {
             indexes: IndexMap::new(),
             extensions: serde_json::Value::Object(serde_json::Map::new()),
             lsn: 0,
+            stats: IndexMap::new(),
+            vector_indexes: IndexMap::new(),
         }
+    }
+
+    /// Mark all column stats as stale. Called after any write operation.
+    pub fn invalidate_stats(&mut self) {
+        for s in self.stats.values_mut() {
+            s.valid = false;
+        }
+    }
+
+    /// Recompute statistics for all columns and mark them valid.
+    pub fn analyze(&mut self) -> crate::core::error::VtfResult<()> {
+        for col in &self.columns {
+            let col_data = &self.data[&col.name];
+            let s = crate::query::aggregate::compute_stats(col_data)?;
+            self.stats.insert(col.name.clone(), s);
+        }
+        Ok(())
     }
 
     pub fn find_column(&self, name: &str) -> Option<&Column> {

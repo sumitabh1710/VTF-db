@@ -36,6 +36,10 @@ fn command_label(cmd: &Commands) -> &'static str {
         Commands::Explain { .. } => "EXPLAIN",
         Commands::AddColumn { .. } => "ADD-COLUMN",
         Commands::CreateIndex { .. } => "CREATE-INDEX",
+        Commands::Analyze { .. } => "ANALYZE",
+        Commands::Check { .. } => "CHECK",
+        Commands::Join { .. } => "JOIN",
+        Commands::BuildVectorIndex { .. } => "BUILD-VECTOR-INDEX",
     }
 }
 
@@ -111,6 +115,14 @@ fn run_inner(command: Commands) -> Result<(), VtfError> {
             column,
             index_type,
         } => cmd_create_index(&file, &column, &index_type),
+
+        Commands::Analyze { file } => cmd_analyze(&file),
+
+        Commands::Check { file } => cmd_check(&file),
+
+        Commands::Join { left, right, on, output } => cmd_join(&left, &right, &on, output.as_ref()),
+
+        Commands::BuildVectorIndex { file, column } => cmd_build_vector_index(&file, &column),
     }
 }
 
@@ -332,14 +344,14 @@ fn cmd_explain(file: &PathBuf, filter_str: &str) -> Result<(), VtfError> {
     let table = storage::load_with_wal(file)?;
     let expr = query_parser::parse(filter_str)
         .map_err(|e| VtfError::query(format!("failed to parse filter: {e}")))?;
-    let plan = table.plan_query(&expr);
+    let node = table.plan_query(&expr);
     println!("Query plan for: {filter_str}\n");
-    print_plan(&plan, "", true);
+    print_plan_node(&node, "", true);
     println!("\n{} rows in table, {} index(es) available", table.row_count, table.indexes.len());
     Ok(())
 }
 
-fn print_plan(plan: &crate::query::planner::Plan, prefix: &str, is_last: bool) {
+fn print_plan_node(node: &crate::query::planner::PlanNode, prefix: &str, is_last: bool) {
     use crate::query::planner::Plan;
     let connector = if is_last { "└── " } else { "├── " };
     let child_prefix = if is_last {
@@ -347,10 +359,15 @@ fn print_plan(plan: &crate::query::planner::Plan, prefix: &str, is_last: bool) {
     } else {
         format!("{prefix}│   ")
     };
+    let stats_suffix = format!(
+        "  [est. rows: {}, cost: {:.1}]",
+        node.estimated_rows,
+        node.cost
+    );
 
-    match plan {
+    match &node.plan {
         Plan::HashIndexLookup { column, value } => {
-            println!("{prefix}{connector}HashIndexLookup({column} = {value})  [index scan]");
+            println!("{prefix}{connector}HashIndexLookup({column} = {value})  [index scan]{stats_suffix}");
         }
         Plan::SortedIndexRange { column, low, high, low_inclusive, high_inclusive } => {
             let range = match (low, high) {
@@ -369,24 +386,24 @@ fn print_plan(plan: &crate::query::planner::Plan, prefix: &str, is_last: bool) {
                 }
                 (None, None) => format!("{column} (full range)"),
             };
-            println!("{prefix}{connector}SortedIndexRange({range})  [sorted index]");
+            println!("{prefix}{connector}SortedIndexRange({range})  [sorted index]{stats_suffix}");
         }
         Plan::ColumnScan { expr } => {
-            println!("{prefix}{connector}ColumnScan({expr})  [full scan]");
+            println!("{prefix}{connector}ColumnScan({expr})  [full scan]{stats_suffix}");
         }
         Plan::Intersect(left, right) => {
-            println!("{prefix}{connector}Intersect");
-            print_plan(left, &child_prefix, false);
-            print_plan(right, &child_prefix, true);
+            println!("{prefix}{connector}Intersect{stats_suffix}");
+            print_plan_node(left, &child_prefix, false);
+            print_plan_node(right, &child_prefix, true);
         }
         Plan::Union(left, right) => {
-            println!("{prefix}{connector}Union");
-            print_plan(left, &child_prefix, false);
-            print_plan(right, &child_prefix, true);
+            println!("{prefix}{connector}Union{stats_suffix}");
+            print_plan_node(left, &child_prefix, false);
+            print_plan_node(right, &child_prefix, true);
         }
         Plan::Complement(inner) => {
-            println!("{prefix}{connector}Complement");
-            print_plan(inner, &child_prefix, true);
+            println!("{prefix}{connector}Complement{stats_suffix}");
+            print_plan_node(inner, &child_prefix, true);
         }
     }
 }
@@ -563,7 +580,8 @@ fn cmd_txn(file: &PathBuf, ops_json: &str) -> Result<(), VtfError> {
         .ok_or_else(|| VtfError::insert("--ops must be a JSON array"))?;
 
     let mut table = storage::load_with_wal(file)?;
-    let mut txn = Transaction::new();
+    // CLI transactions load fresh from disk so OCC is not needed here.
+    let mut txn = Transaction::new(&table);
 
     for (i, op_val) in ops_arr.iter().enumerate() {
         let op_obj = op_val
@@ -662,7 +680,16 @@ fn cmd_search(
         }
     };
 
-    let results = vector::top_k(&table, column, &query_vec, k, metric)?;
+    // Route through HNSW index if available and metric is cosine; fall back to brute force.
+    let results = if metric == Metric::Cosine && table.vector_indexes.contains_key(column) {
+        let query_f32: Vec<f32> = query_vec.iter().map(|&x| x as f32).collect();
+        crate::index::hnsw::search_with_hnsw_or_brute(&table, column, &query_f32, k)?
+            .into_iter()
+            .map(|(i, s)| (i, s as f64))
+            .collect()
+    } else {
+        vector::top_k(&table, column, &query_vec, k, metric)?
+    };
 
     if results.is_empty() {
         println!("No matching vectors.");
@@ -882,4 +909,95 @@ fn format_value(v: &serde_json::Value) -> String {
         }
         serde_json::Value::Object(_) => "{...}".to_string(),
     }
+}
+
+fn cmd_check(file: &PathBuf) -> Result<(), VtfError> {
+    let mut table = storage::load_with_wal(file)?;
+    let original_indexes = table.indexes.clone();
+    table.rebuild_indexes()?;
+
+    let mut issues = 0;
+    for (col_name, rebuilt) in &table.indexes {
+        match original_indexes.get(col_name) {
+            None => {
+                println!("  MISSING index on '{col_name}'");
+                issues += 1;
+            }
+            Some(orig) => {
+                if orig.map != rebuilt.map {
+                    println!("  INCONSISTENT index on '{col_name}': map mismatch");
+                    issues += 1;
+                }
+                if orig.sorted_keys != rebuilt.sorted_keys {
+                    println!("  INCONSISTENT index on '{col_name}': sorted_keys mismatch");
+                    issues += 1;
+                }
+            }
+        }
+    }
+    for col_name in original_indexes.keys() {
+        if !table.indexes.contains_key(col_name) {
+            println!("  ORPHAN index on '{col_name}': column no longer exists");
+            issues += 1;
+        }
+    }
+
+    if issues == 0 {
+        println!("CHECK OK: all {} index(es) are consistent", table.indexes.len());
+    } else {
+        println!("CHECK FAILED: {issues} issue(s) found");
+        return Err(VtfError::validation(format!("index check found {issues} issue(s)")));
+    }
+    Ok(())
+}
+
+fn cmd_join(left_path: &PathBuf, right_path: &PathBuf, on: &str, output: Option<&PathBuf>) -> Result<(), VtfError> {
+    let left = storage::load_with_wal(left_path)?;
+    let right = storage::load_with_wal(right_path)?;
+
+    let (left_col, right_col) = parse_join_on(on)?;
+    let result = crate::engine::join::hash_join(&left, &left_col, &right, &right_col)?;
+
+    if let Some(out) = output {
+        storage::io::save(&result, out)?;
+        println!("Joined {} rows written to {}", result.row_count, out.display());
+    } else {
+        let json = result.to_json()?;
+        println!("{json}");
+    }
+    Ok(())
+}
+
+fn parse_join_on(on: &str) -> Result<(String, String), VtfError> {
+    let parts: Vec<&str> = on.splitn(2, '=').collect();
+    if parts.len() != 2 {
+        return Err(VtfError::query("--on must be 'left_col=right_col'"));
+    }
+    Ok((parts[0].trim().to_string(), parts[1].trim().to_string()))
+}
+
+fn cmd_build_vector_index(file: &PathBuf, column: &str) -> Result<(), VtfError> {
+    let mut table = storage::load_with_wal(file)?;
+    crate::index::hnsw::build_hnsw_index(&mut table, column)?;
+    storage::io::save(&table, file)?;
+    println!("HNSW index built on column '{column}'");
+    Ok(())
+}
+
+fn cmd_analyze(file: &PathBuf) -> Result<(), VtfError> {
+    let mut table = storage::load_with_wal(file)?;
+    table.analyze()?;
+    storage::io::save(&table, file)?;
+    for (col_name, s) in &table.stats {
+        println!(
+            "  {col_name}: rows={}, nulls={}, distinct={}, min={}, max={}",
+            s.row_count,
+            s.null_count,
+            s.distinct_count,
+            s.min.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string()),
+            s.max.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string()),
+        );
+    }
+    println!("ANALYZE complete ({} columns)", table.stats.len());
+    Ok(())
 }

@@ -20,6 +20,7 @@ pub fn build_hash_index(column: &str, data: &ColumnData) -> VtfResult<IndexDef> 
     Ok(IndexDef {
         column: column.to_string(),
         index_type: IndexType::Hash,
+        column_type: data.col_type(),
         map,
         sorted_keys: None,
     })

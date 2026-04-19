@@ -23,6 +23,7 @@ pub fn compact(vtf_path: &Path) -> VtfResult<VtfTable> {
 
 /// Load a table with WAL replay. If the WAL has entries, replay them
 /// onto the base table. Logs replay timing to stderr.
+/// Stats are invalidated after replay since WAL writes stale them.
 pub fn load_with_wal(vtf_path: &Path) -> VtfResult<VtfTable> {
     let mut table = io::load(vtf_path)?;
     let entries = wal::read_entries(vtf_path)?;
@@ -37,6 +38,8 @@ pub fn load_with_wal(vtf_path: &Path) -> VtfResult<VtfTable> {
             count,
             elapsed.as_secs_f64() * 1000.0
         );
+        // Stats loaded from the base file are now stale because WAL mutations were applied.
+        table.invalidate_stats();
     }
 
     Ok(table)

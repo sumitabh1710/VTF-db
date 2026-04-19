@@ -7,7 +7,11 @@ use crate::core::model::*;
 
 /// Magic bytes to identify a VTF binary file: "VTFb" (0x56 0x54 0x46 0x62)
 pub const MAGIC: &[u8; 4] = b"VTFb";
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION_V1: u8 = 1;
+/// V2 adds: unique/not-null constraints, defaults, indexes (type + map + sorted_keys), LSN, extensions JSON.
+const FORMAT_VERSION_V2: u8 = 2;
+/// The version written by the encoder.
+const FORMAT_VERSION: u8 = FORMAT_VERSION_V2;
 
 /// Check if raw bytes start with the VTF binary magic bytes.
 pub fn is_binary_format(data: &[u8]) -> bool {
@@ -55,7 +59,78 @@ pub fn encode(table: &VtfTable) -> VtfResult<Vec<u8>> {
         encode_column(&mut buf, col_data, table.row_count)?;
     }
 
+    // --- V2 extension section ---
+    // Unique columns
+    buf.write_all(&(table.meta.unique_columns.len() as u32).to_le_bytes())?;
+    for col in &table.meta.unique_columns {
+        write_string(&mut buf, col)?;
+    }
+
+    // Not-null columns
+    buf.write_all(&(table.meta.not_null_columns.len() as u32).to_le_bytes())?;
+    for col in &table.meta.not_null_columns {
+        write_string(&mut buf, col)?;
+    }
+
+    // Defaults (JSON object encoded as a length-prefixed JSON string)
+    let defaults_json = serde_json::to_string(&table.meta.defaults)
+        .unwrap_or_else(|_| "{}".to_string());
+    write_string_u32(&mut buf, &defaults_json)?;
+
+    // Indexes
+    buf.write_all(&(table.indexes.len() as u32).to_le_bytes())?;
+    for (col_name, idx) in &table.indexes {
+        write_string(&mut buf, col_name)?;
+        // Index type byte: 0 = hash, 1 = sorted
+        let type_byte: u8 = match idx.index_type { IndexType::Hash => 0, IndexType::Sorted => 1 };
+        buf.write_all(&[type_byte])?;
+        // Column type byte
+        buf.write_all(&[column_type_to_byte(&idx.column_type)])?;
+        // Map: entry count + each (key, row_ids)
+        buf.write_all(&(idx.map.len() as u32).to_le_bytes())?;
+        for (key, rows) in &idx.map {
+            write_string(&mut buf, key)?;
+            buf.write_all(&(rows.len() as u32).to_le_bytes())?;
+            for &row_id in rows {
+                buf.write_all(&(row_id as u32).to_le_bytes())?;
+            }
+        }
+        // Sorted keys
+        let sk_count = idx.sorted_keys.as_ref().map(|v| v.len()).unwrap_or(0);
+        buf.write_all(&(sk_count as u32).to_le_bytes())?;
+        if let Some(ref keys) = idx.sorted_keys {
+            for k in keys {
+                write_string(&mut buf, k)?;
+            }
+        }
+    }
+
+    // LSN (8 bytes)
+    buf.write_all(&table.lsn.to_le_bytes())?;
+
+    // Extensions (length-prefixed JSON)
+    let ext_json = serde_json::to_string(&table.extensions)
+        .unwrap_or_else(|_| "{}".to_string());
+    write_string_u32(&mut buf, &ext_json)?;
+
     Ok(buf)
+}
+
+/// Write a string with a u32 length prefix (for large blobs like JSON).
+fn write_string_u32(buf: &mut Vec<u8>, s: &str) -> VtfResult<()> {
+    let bytes = s.as_bytes();
+    buf.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    buf.write_all(bytes)?;
+    Ok(())
+}
+
+fn read_string_u32(cursor: &mut Cursor<&[u8]>) -> VtfResult<String> {
+    let len = read_u32(cursor)? as usize;
+    let mut bytes = vec![0u8; len];
+    cursor.read_exact(&mut bytes)?;
+    String::from_utf8(bytes).map_err(|e| {
+        VtfError::Storage(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    })
 }
 
 /// Decode only the specified columns from binary data, skipping the rest.
@@ -70,12 +145,12 @@ pub fn decode_partial(data: &[u8], needed: &std::collections::HashSet<String>) -
         return Err(VtfError::validation("invalid binary magic bytes"));
     }
 
-    let mut version = [0u8; 1];
-    cursor.read_exact(&mut version)?;
-    if version[0] != FORMAT_VERSION {
+    let mut version_buf = [0u8; 1];
+    cursor.read_exact(&mut version_buf)?;
+    let file_version = version_buf[0];
+    if file_version != FORMAT_VERSION_V1 && file_version != FORMAT_VERSION_V2 {
         return Err(VtfError::validation(format!(
-            "unsupported binary format version: {}",
-            version[0]
+            "unsupported binary format version: {file_version}"
         )));
     }
 
@@ -110,20 +185,26 @@ pub fn decode_partial(data: &[u8], needed: &std::collections::HashSet<String>) -
         }
     }
 
+    let (meta, indexes, lsn, extensions) = if file_version >= FORMAT_VERSION_V2 {
+        decode_v2_extensions(&mut cursor, primary_key, &columns)?
+    } else {
+        (Meta { primary_key, unique_columns: vec![], not_null_columns: vec![], defaults: IndexMap::new() },
+         IndexMap::new(), 0, serde_json::Value::Object(serde_json::Map::new()))
+    };
+
+    let vector_indexes = crate::storage::validation::load_vector_indexes_from_extensions_pub(&extensions);
+
     Ok(VtfTable {
         version: "1.0".to_string(),
         columns,
         row_count,
         data: col_data_map,
-        meta: Meta {
-            primary_key,
-            unique_columns: Vec::new(),
-            not_null_columns: Vec::new(),
-            defaults: IndexMap::new(),
-        },
-        indexes: IndexMap::new(),
-        extensions: serde_json::Value::Object(serde_json::Map::new()),
-        lsn: 0,
+        meta,
+        indexes,
+        extensions,
+        lsn,
+        stats: IndexMap::new(),
+        vector_indexes,
     })
 }
 
@@ -137,12 +218,12 @@ pub fn decode(data: &[u8]) -> VtfResult<VtfTable> {
         return Err(VtfError::validation("invalid binary magic bytes"));
     }
 
-    let mut version = [0u8; 1];
-    cursor.read_exact(&mut version)?;
-    if version[0] != FORMAT_VERSION {
+    let mut version_buf = [0u8; 1];
+    cursor.read_exact(&mut version_buf)?;
+    let file_version = version_buf[0];
+    if file_version != FORMAT_VERSION_V1 && file_version != FORMAT_VERSION_V2 {
         return Err(VtfError::validation(format!(
-            "unsupported binary format version: {}",
-            version[0]
+            "unsupported binary format version: {file_version}"
         )));
     }
 
@@ -172,20 +253,26 @@ pub fn decode(data: &[u8]) -> VtfResult<VtfTable> {
         col_data_map.insert(col.name.clone(), col_data);
     }
 
+    let (meta, indexes, lsn, extensions) = if file_version >= FORMAT_VERSION_V2 {
+        decode_v2_extensions(&mut cursor, primary_key, &columns)?
+    } else {
+        (Meta { primary_key, unique_columns: vec![], not_null_columns: vec![], defaults: IndexMap::new() },
+         IndexMap::new(), 0, serde_json::Value::Object(serde_json::Map::new()))
+    };
+
+    let vector_indexes = crate::storage::validation::load_vector_indexes_from_extensions_pub(&extensions);
+
     Ok(VtfTable {
         version: "1.0".to_string(),
         columns,
         row_count,
         data: col_data_map,
-        meta: Meta {
-            primary_key,
-            unique_columns: Vec::new(),
-            not_null_columns: Vec::new(),
-            defaults: IndexMap::new(),
-        },
-        indexes: IndexMap::new(),
-        extensions: serde_json::Value::Object(serde_json::Map::new()),
-        lsn: 0,
+        meta,
+        indexes,
+        extensions,
+        lsn,
+        stats: IndexMap::new(),
+        vector_indexes,
     })
 }
 
@@ -243,6 +330,93 @@ fn read_u32(cursor: &mut Cursor<&[u8]>) -> VtfResult<u32> {
     let mut buf = [0u8; 4];
     cursor.read_exact(&mut buf)?;
     Ok(u32::from_le_bytes(buf))
+}
+
+/// Decode the V2 metadata section that follows the column data.
+fn decode_v2_extensions(
+    cursor: &mut Cursor<&[u8]>,
+    primary_key: Option<String>,
+    columns: &[Column],
+) -> VtfResult<(Meta, IndexMap<String, IndexDef>, u64, serde_json::Value)> {
+    // Unique columns
+    let uniq_count = read_u32(cursor)? as usize;
+    let mut unique_columns = Vec::with_capacity(uniq_count);
+    for _ in 0..uniq_count {
+        unique_columns.push(read_string(cursor)?);
+    }
+
+    // Not-null columns
+    let nn_count = read_u32(cursor)? as usize;
+    let mut not_null_columns = Vec::with_capacity(nn_count);
+    for _ in 0..nn_count {
+        not_null_columns.push(read_string(cursor)?);
+    }
+
+    // Defaults
+    let defaults_json = read_string_u32(cursor)?;
+    let defaults: IndexMap<String, serde_json::Value> =
+        serde_json::from_str(&defaults_json).unwrap_or_default();
+
+    // Indexes
+    let idx_count = read_u32(cursor)? as usize;
+    let mut indexes: IndexMap<String, IndexDef> = IndexMap::new();
+    for _ in 0..idx_count {
+        let col_name = read_string(cursor)?;
+        let mut type_buf = [0u8; 1];
+        cursor.read_exact(&mut type_buf)?;
+        let index_type = match type_buf[0] {
+            0 => IndexType::Hash,
+            1 => IndexType::Sorted,
+            other => return Err(VtfError::validation(format!("unknown index type byte: {other}"))),
+        };
+        let mut ct_buf = [0u8; 1];
+        cursor.read_exact(&mut ct_buf)?;
+        let column_type = byte_to_column_type(ct_buf[0])
+            .unwrap_or_else(|_| {
+                // Fall back to the column's declared type if encoding is unknown
+                columns.iter().find(|c| c.name == col_name)
+                    .map(|c| c.col_type.clone())
+                    .unwrap_or(ColumnType::String)
+            });
+
+        let map_entry_count = read_u32(cursor)? as usize;
+        let mut map = std::collections::HashMap::new();
+        for _ in 0..map_entry_count {
+            let key = read_string(cursor)?;
+            let row_count = read_u32(cursor)? as usize;
+            let mut rows = Vec::with_capacity(row_count);
+            for _ in 0..row_count {
+                rows.push(read_u32(cursor)? as usize);
+            }
+            map.insert(key, rows);
+        }
+
+        let sk_count = read_u32(cursor)? as usize;
+        let sorted_keys = if sk_count > 0 {
+            let mut keys = Vec::with_capacity(sk_count);
+            for _ in 0..sk_count {
+                keys.push(read_string(cursor)?);
+            }
+            Some(keys)
+        } else {
+            None
+        };
+
+        indexes.insert(col_name.clone(), IndexDef { column: col_name, index_type, column_type, map, sorted_keys });
+    }
+
+    // LSN
+    let mut lsn_buf = [0u8; 8];
+    cursor.read_exact(&mut lsn_buf)?;
+    let lsn = u64::from_le_bytes(lsn_buf);
+
+    // Extensions
+    let ext_json = read_string_u32(cursor)?;
+    let extensions: serde_json::Value = serde_json::from_str(&ext_json)
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+    let meta = Meta { primary_key, unique_columns, not_null_columns, defaults };
+    Ok((meta, indexes, lsn, extensions))
 }
 
 fn encode_null_bitmap(buf: &mut Vec<u8>, nulls: &[bool]) -> VtfResult<()> {
@@ -751,5 +925,67 @@ mod tests {
         assert_eq!(rows[1]["ai"], json!([1, 2]));
         assert_eq!(rows[0]["as"], json!(["x"]));
         assert!(rows[1]["as"].is_null());
+    }
+
+    #[test]
+    fn v2_roundtrip_preserves_full_metadata() {
+        use crate::core::model::IndexType;
+
+        let j = json!({
+            "version": "1.0",
+            "columns": [
+                {"name": "id", "type": "int"},
+                {"name": "email", "type": "string"},
+                {"name": "score", "type": "float"}
+            ],
+            "rowCount": 3,
+            "data": {
+                "id": [1, 2, 3],
+                "email": ["a@b.com", "c@d.com", "e@f.com"],
+                "score": [9.5, 7.2, 8.0]
+            },
+            "meta": {
+                "primaryKey": "id",
+                "uniqueColumns": ["email"],
+                "notNullColumns": ["email"]
+            }
+        });
+        let mut table = validation::validate_and_build(j).unwrap();
+        table.create_index("id", IndexType::Hash).unwrap();
+        table.create_index("score", IndexType::Sorted).unwrap();
+        table.lsn = 42;
+
+        let bytes = encode(&table).unwrap();
+        let decoded = decode(&bytes).unwrap();
+
+        assert_eq!(decoded.meta.primary_key, Some("id".to_string()));
+        assert_eq!(decoded.meta.unique_columns, vec!["email"]);
+        assert_eq!(decoded.meta.not_null_columns, vec!["email"]);
+        assert_eq!(decoded.lsn, 42);
+        assert!(decoded.indexes.contains_key("id"), "id index should survive roundtrip");
+        assert!(decoded.indexes.contains_key("score"), "score index should survive roundtrip");
+        assert_eq!(decoded.row_count, 3);
+    }
+
+    #[test]
+    fn v2_index_roundtrip_correctness() {
+        let j = json!({
+            "version": "1.0",
+            "columns": [
+                {"name": "n", "type": "int"}
+            ],
+            "rowCount": 5,
+            "data": { "n": [9, 10, 2, 11, 1] }
+        });
+        let mut table = validation::validate_and_build(j).unwrap();
+        table.create_index("n", crate::core::model::IndexType::Sorted).unwrap();
+
+        let bytes = encode(&table).unwrap();
+        let decoded = decode(&bytes).unwrap();
+
+        let idx = decoded.indexes.get("n").expect("index must survive roundtrip");
+        let keys = idx.sorted_keys.as_ref().expect("sorted_keys must survive");
+        // Must be numerically sorted: 1, 2, 9, 10, 11
+        assert_eq!(keys, &["1", "2", "9", "10", "11"]);
     }
 }

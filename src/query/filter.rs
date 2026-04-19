@@ -16,7 +16,7 @@ impl VtfTable {
     }
 
     /// Filter rows where `column = value`. Returns matching row indices.
-    /// Uses hash index if available, otherwise falls back to linear scan.
+    /// Uses hash index if available, otherwise falls back to a typed linear scan.
     pub fn filter_eq(&self, column: &str, value: &Value) -> VtfResult<Vec<usize>> {
         if !self.data.contains_key(column) {
             return Err(VtfError::query(format!("column '{column}' not found")));
@@ -28,14 +28,7 @@ impl VtfTable {
         }
 
         let col_data = &self.data[column];
-        let mut matches = Vec::new();
-        for i in 0..self.row_count {
-            let cell = col_data.get_json_value(i).unwrap_or(Value::Null);
-            if values_match(&cell, value) {
-                matches.push(i);
-            }
-        }
-        Ok(matches)
+        Ok(typed_eq_scan(col_data, value))
     }
 
     /// Reconstruct rows at the given indices, projecting only the specified columns.
@@ -123,13 +116,13 @@ impl VtfTable {
         Ok(())
     }
 
-    /// Compare rows against a value. `is_less` = true means we want rows < value (or <=).
-    /// `inclusive` determines strict vs non-strict.
-    fn filter_cmp(&self, column: &str, value: &Value, is_less: bool, inclusive: bool) -> VtfResult<Vec<usize>> {
+    /// Compare rows against a value using typed comparisons (no per-row JSON allocation).
+    /// `is_less` = true means we want rows < value (or <=). `inclusive` is strict vs non-strict.
+    pub fn filter_cmp(&self, column: &str, value: &Value, is_less: bool, inclusive: bool) -> VtfResult<Vec<usize>> {
         self.validate_column(column)?;
         let col_data = &self.data[column];
 
-        // Try sorted index if available
+        // Use sorted index if available
         if let Some(idx) = self.indexes.get(column) {
             if idx.sorted_keys.is_some() {
                 let search_key = value_to_search_key(value);
@@ -142,38 +135,149 @@ impl VtfTable {
             }
         }
 
-        // Linear scan
-        let mut matches = Vec::new();
-        for i in 0..self.row_count {
-            let cell = col_data.get_json_value(i).unwrap_or(Value::Null);
-            if cell.is_null() {
-                continue;
-            }
-            let ord = compare_values(&cell, value);
-            let pass = match ord {
-                Some(std::cmp::Ordering::Less) => is_less,
-                Some(std::cmp::Ordering::Equal) => inclusive,
-                Some(std::cmp::Ordering::Greater) => !is_less,
-                None => false,
-            };
-            if pass {
-                matches.push(i);
-            }
-        }
-        Ok(matches)
+        // Typed linear scan — no per-row serde_json::Value allocation
+        Ok(typed_cmp_scan(col_data, value, is_less, inclusive))
     }
 }
 
-fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
-    match (a, b) {
-        (Value::Number(an), Value::Number(bn)) => {
-            let af = an.as_f64()?;
-            let bf = bn.as_f64()?;
-            af.partial_cmp(&bf)
+// ---------------------------------------------------------------------------
+// Typed scan helpers — operate directly on the native Vec<Option<T>> storage
+// to avoid allocating serde_json::Value per row.
+// ---------------------------------------------------------------------------
+
+/// Equality scan without index: compare directly against the native typed storage.
+fn typed_eq_scan(col_data: &ColumnData, value: &Value) -> Vec<usize> {
+    match col_data {
+        ColumnData::Int(v) => {
+            // Accept both integer and float literals that are whole numbers.
+            if let Some(target) = value.as_i64().or_else(|| value.as_f64().and_then(|f| {
+                if f.fract() == 0.0 { Some(f as i64) } else { None }
+            })) {
+                v.iter().enumerate()
+                    .filter_map(|(i, cell)| if *cell == Some(target) { Some(i) } else { None })
+                    .collect()
+            } else if value.is_null() {
+                v.iter().enumerate()
+                    .filter_map(|(i, cell)| if cell.is_none() { Some(i) } else { None })
+                    .collect()
+            } else {
+                vec![]
+            }
         }
-        (Value::String(a_s), Value::String(b_s)) => Some(a_s.cmp(b_s)),
-        (Value::Bool(a_b), Value::Bool(b_b)) => Some(a_b.cmp(b_b)),
-        _ => None,
+        ColumnData::Float(v) => {
+            if let Some(target) = value.as_f64() {
+                v.iter().enumerate()
+                    .filter_map(|(i, cell)| if *cell == Some(target) { Some(i) } else { None })
+                    .collect()
+            } else if value.is_null() {
+                v.iter().enumerate()
+                    .filter_map(|(i, cell)| if cell.is_none() { Some(i) } else { None })
+                    .collect()
+            } else {
+                vec![]
+            }
+        }
+        ColumnData::Str(v) | ColumnData::Date(v) => {
+            if let Some(target) = value.as_str() {
+                v.iter().enumerate()
+                    .filter_map(|(i, cell)| {
+                        if cell.as_deref() == Some(target) { Some(i) } else { None }
+                    })
+                    .collect()
+            } else if value.is_null() {
+                v.iter().enumerate()
+                    .filter_map(|(i, cell)| if cell.is_none() { Some(i) } else { None })
+                    .collect()
+            } else {
+                vec![]
+            }
+        }
+        ColumnData::Bool(v) => {
+            if let Some(target) = value.as_bool() {
+                v.iter().enumerate()
+                    .filter_map(|(i, cell)| if *cell == Some(target) { Some(i) } else { None })
+                    .collect()
+            } else if value.is_null() {
+                v.iter().enumerate()
+                    .filter_map(|(i, cell)| if cell.is_none() { Some(i) } else { None })
+                    .collect()
+            } else {
+                vec![]
+            }
+        }
+        // Array columns: not equality-scannable in the scalar sense; fall back to JSON comparison.
+        _ => {
+            (0..col_data.len())
+                .filter(|&i| {
+                    col_data.get_json_value(i).unwrap_or(Value::Null) == *value
+                })
+                .collect()
+        }
+    }
+}
+
+/// Range comparison scan without index: compare directly against native typed storage.
+/// `is_less` = want rows < value; `inclusive` = include equality.
+fn typed_cmp_scan(col_data: &ColumnData, value: &Value, is_less: bool, inclusive: bool) -> Vec<usize> {
+    fn ord_passes(ord: std::cmp::Ordering, is_less: bool, inclusive: bool) -> bool {
+        match ord {
+            std::cmp::Ordering::Less => is_less,
+            std::cmp::Ordering::Equal => inclusive,
+            std::cmp::Ordering::Greater => !is_less,
+        }
+    }
+
+    match col_data {
+        ColumnData::Int(v) => {
+            if let Some(target) = value.as_i64().or_else(|| value.as_f64().map(|f| f as i64)) {
+                v.iter().enumerate()
+                    .filter_map(|(i, cell)| {
+                        let n = (*cell)?;
+                        if ord_passes(n.cmp(&target), is_less, inclusive) { Some(i) } else { None }
+                    })
+                    .collect()
+            } else {
+                vec![]
+            }
+        }
+        ColumnData::Float(v) => {
+            if let Some(target) = value.as_f64() {
+                v.iter().enumerate()
+                    .filter_map(|(i, cell)| {
+                        let n = (*cell)?;
+                        let ord = n.partial_cmp(&target).unwrap_or(std::cmp::Ordering::Less);
+                        if ord_passes(ord, is_less, inclusive) { Some(i) } else { None }
+                    })
+                    .collect()
+            } else {
+                vec![]
+            }
+        }
+        ColumnData::Str(v) | ColumnData::Date(v) => {
+            if let Some(target) = value.as_str() {
+                v.iter().enumerate()
+                    .filter_map(|(i, cell)| {
+                        let s = cell.as_deref()?;
+                        if ord_passes(s.cmp(target), is_less, inclusive) { Some(i) } else { None }
+                    })
+                    .collect()
+            } else {
+                vec![]
+            }
+        }
+        ColumnData::Bool(v) => {
+            if let Some(target) = value.as_bool() {
+                v.iter().enumerate()
+                    .filter_map(|(i, cell)| {
+                        let b = (*cell)?;
+                        if ord_passes(b.cmp(&target), is_less, inclusive) { Some(i) } else { None }
+                    })
+                    .collect()
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
     }
 }
 
@@ -184,20 +288,6 @@ fn value_to_search_key(val: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Null => "null".to_string(),
         _ => val.to_string(),
-    }
-}
-
-fn values_match(cell: &Value, search: &Value) -> bool {
-    match (cell, search) {
-        (Value::Number(a), Value::Number(b)) => {
-            if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
-                ai == bi
-            } else {
-                a.as_f64() == b.as_f64()
-            }
-        }
-        (Value::Null, Value::Null) => true,
-        _ => cell == search,
     }
 }
 
@@ -284,5 +374,26 @@ mod tests {
     fn test_select_rows_out_of_bounds() {
         let table = test_table();
         assert!(table.select_rows(&[10], &[]).is_err());
+    }
+
+    #[test]
+    fn typed_cmp_scan_int_range() {
+        let table = test_table();
+        let matches = table.filter_cmp("age", &serde_json::json!(25), false, false).unwrap();
+        // age > 25: rows 0 and 2 (age=30)
+        assert_eq!(matches, vec![0, 2]);
+    }
+
+    #[test]
+    fn typed_eq_scan_null() {
+        let j = serde_json::json!({
+            "version": "1.0",
+            "columns": [{"name": "x", "type": "int"}],
+            "rowCount": 3,
+            "data": {"x": [1, null, 3]}
+        });
+        let table = validation::validate_and_build(j).unwrap();
+        let matches = table.filter_eq("x", &serde_json::Value::Null).unwrap();
+        assert_eq!(matches, vec![1]);
     }
 }

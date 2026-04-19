@@ -11,19 +11,35 @@ use crate::core::model::*;
 use crate::storage::validation;
 
 /// Load a VTF file from disk with a shared (read) lock.
+/// Automatically detects JSON vs binary (v1 or v2) format.
 pub fn load(path: &Path) -> VtfResult<VtfTable> {
     let lock_file = fs::File::open(path)?;
     lock_file.lock_shared().map_err(|e| {
         VtfError::Storage(std::io::Error::new(e.kind(), format!("failed to acquire shared lock: {e}")))
     })?;
-    let contents = fs::read_to_string(path)?;
+    let contents = fs::read(path)?;
     lock_file.unlock().ok();
-    let raw: Value = serde_json::from_str(&contents)?;
-    validation::validate_and_build(raw)
+
+    if crate::storage::binary::is_binary_format(&contents) {
+        crate::storage::binary::decode(&contents)
+    } else {
+        let text = String::from_utf8(contents).map_err(|e| {
+            VtfError::Storage(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+        })?;
+        let raw: Value = serde_json::from_str(&text)?;
+        validation::validate_and_build(raw)
+    }
 }
 
-/// Save a VtfTable to disk atomically with an exclusive (write) lock.
+/// Save a VtfTable to disk in binary v2 format with an exclusive (write) lock.
+/// Binary format is more compact and preserves all metadata (indexes, constraints, LSN).
 pub fn save(table: &VtfTable, path: &Path) -> VtfResult<()> {
+    save_binary(table, path)
+}
+
+/// Save a VtfTable in JSON format atomically with an exclusive lock.
+/// Use this when you explicitly need a human-readable file (e.g. `vtf export --format json`).
+pub fn save_json(table: &VtfTable, path: &Path) -> VtfResult<()> {
     let lock_file = fs::OpenOptions::new()
         .create(true)
         .write(true)

@@ -12,7 +12,7 @@ use crate::storage::wal::{self, WalEntry};
 ///
 /// # Usage
 /// ```rust,ignore
-/// let mut txn = Transaction::new();
+/// let mut txn = Transaction::new(&table);
 /// txn.insert(row1);
 /// txn.delete("id = 5", vec![json!(5)]);
 /// txn.commit(&path, &mut table)?;
@@ -25,16 +25,50 @@ use crate::storage::wal::{self, WalEntry};
 ///
 /// A crash between TxnBegin and TxnCommit leaves no committed txn_id in the
 /// WAL, so replay ignores the entire group.
+///
+/// ## Optimistic Concurrency Control (OCC)
+///
+/// `read_lsn` captures the table's LSN at transaction start. On commit,
+/// if the table's LSN has advanced (another writer modified the table),
+/// `VtfError::OccConflict` is returned and the transaction is not applied.
+/// The caller must reload the table and retry.
+///
+/// This provides snapshot-isolation semantics for the embedded API:
+/// ```rust,ignore
+/// loop {
+///     let mut table = storage::load_with_wal(&path)?;
+///     let mut txn = Transaction::new(&table);
+///     txn.insert(my_row);
+///     match txn.commit(&path, &mut table) {
+///         Ok(_) => break,
+///         Err(VtfError::OccConflict { .. }) => continue, // retry
+///         Err(e) => return Err(e),
+///     }
+/// }
+/// ```
 pub struct Transaction {
     pub txn_id: String,
+    /// LSN at the time this transaction was created. Used for OCC conflict detection.
+    pub read_lsn: u64,
     ops: Vec<WalEntry>,
 }
 
 impl Transaction {
-    /// Create a new transaction with a generated UUID-style ID.
-    pub fn new() -> Self {
+    /// Create a new transaction, capturing the current LSN of `table` as the read snapshot.
+    pub fn new(table: &VtfTable) -> Self {
         Transaction {
             txn_id: generate_txn_id(),
+            read_lsn: table.lsn,
+            ops: Vec::new(),
+        }
+    }
+
+    /// Create a transaction without OCC (read_lsn = 0 always passes).
+    /// Useful for migrations, tests, and CLI operations that load fresh from disk.
+    pub fn new_unchecked() -> Self {
+        Transaction {
+            txn_id: generate_txn_id(),
+            read_lsn: u64::MAX, // sentinel: skip OCC check
             ops: Vec::new(),
         }
     }
@@ -87,6 +121,16 @@ impl Transaction {
             return Ok(());
         }
 
+        // OCC conflict check: if another writer has committed since we started,
+        // abort this transaction so the caller can reload and retry.
+        // The sentinel value u64::MAX bypasses the check for unchecked transactions.
+        if self.read_lsn != u64::MAX && table.lsn != self.read_lsn {
+            return Err(VtfError::OccConflict {
+                read_lsn: self.read_lsn,
+                current_lsn: table.lsn,
+            });
+        }
+
         // Build the full sequence: begin + ops + commit
         let mut wal_entries = Vec::with_capacity(self.ops.len() + 2);
         wal_entries.push(WalEntry::TxnBegin { txn_id: self.txn_id.clone() });
@@ -118,8 +162,10 @@ impl Transaction {
 }
 
 impl Default for Transaction {
+    /// Creates an unchecked transaction (no OCC). Use `Transaction::new(&table)` when
+    /// OCC conflict detection is desired.
     fn default() -> Self {
-        Self::new()
+        Self::new_unchecked()
     }
 }
 
@@ -159,7 +205,7 @@ mod tests {
         let mut table = test_table();
         io::save(&table, &path).unwrap();
 
-        let mut txn = Transaction::new();
+        let mut txn = Transaction::new(&table);
         let mut row1 = IndexMap::new();
         row1.insert("id".to_string(), json!(1));
         row1.insert("name".to_string(), json!("Alice"));
@@ -185,7 +231,7 @@ mod tests {
         let mut table = test_table();
         io::save(&table, &path).unwrap();
 
-        let mut txn = Transaction::new();
+        let mut txn = Transaction::new(&table);
         let mut row = IndexMap::new();
         row.insert("id".to_string(), json!(1));
         row.insert("name".to_string(), json!("Alice"));
@@ -231,7 +277,7 @@ mod tests {
         let mut table = test_table();
         io::save(&table, &path).unwrap();
 
-        let mut txn = Transaction::new();
+        let mut txn = Transaction::new(&table);
         let mut row = IndexMap::new();
         row.insert("id".to_string(), json!(1));
         row.insert("name".to_string(), json!("Alice"));
@@ -258,7 +304,7 @@ mod tests {
         table.insert(row1).unwrap();
         io::save(&table, &path).unwrap();
 
-        let mut txn = Transaction::new();
+        let mut txn = Transaction::new(&table);
         // Delete Alice
         txn.delete("id = 1", vec![json!(1)]);
         // Insert Bob
@@ -271,5 +317,59 @@ mod tests {
         assert_eq!(table.row_count, 1);
         let rows = table.select_rows(&[0], &[]).unwrap();
         assert_eq!(rows[0]["name"], json!("Bob"));
+    }
+
+    #[test]
+    fn occ_conflict_detected_when_lsn_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.vtf");
+        let mut table = test_table();
+        io::save(&table, &path).unwrap();
+
+        // Start transaction at LSN 0
+        let mut txn = Transaction::new(&table);
+        assert_eq!(txn.read_lsn, 0);
+
+        // Simulate concurrent write: another writer inserts a row and advances the LSN
+        let mut row = IndexMap::new();
+        row.insert("id".to_string(), json!(99));
+        row.insert("name".to_string(), json!("Concurrent"));
+        table.insert(row).unwrap();
+        table.lsn += 1; // advance LSN as a WAL commit would
+
+        // Our transaction's row
+        let mut row = IndexMap::new();
+        row.insert("id".to_string(), json!(1));
+        row.insert("name".to_string(), json!("Alice"));
+        txn.insert(row);
+
+        // Commit must fail with OccConflict
+        let result = txn.commit(&path, &mut table);
+        assert!(
+            matches!(result, Err(VtfError::OccConflict { read_lsn: 0, current_lsn: 1 })),
+            "expected OccConflict, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn unchecked_transaction_bypasses_occ() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.vtf");
+        let mut table = test_table();
+        io::save(&table, &path).unwrap();
+
+        // Advance LSN so a checked txn would fail
+        table.lsn = 42;
+
+        let mut txn = Transaction::new_unchecked();
+        let mut row = IndexMap::new();
+        row.insert("id".to_string(), json!(1));
+        row.insert("name".to_string(), json!("Alice"));
+        txn.insert(row);
+
+        // Should succeed regardless of LSN
+        txn.commit(&path, &mut table).unwrap();
+        assert_eq!(table.row_count, 1);
     }
 }

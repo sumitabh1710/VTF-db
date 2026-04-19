@@ -15,6 +15,7 @@ tempfile = "3"
 fs2 = "0.4"
 zstd = "0.13"
 crc32fast = "1"
+instant-distance = { version = "0.6.1", features = ["serde", "with-serde"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
