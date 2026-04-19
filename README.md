@@ -1,7 +1,7 @@
 # VTF — Vector Table Format
 
 A columnar, typed, embedded database built in Rust.  
-VTF stores data column-by-column (not row-by-row), uses a Write-Ahead Log for crash safety, supports vector similarity search, multi-operation transactions, and schema constraints — all from a single binary with zero runtime dependencies.
+VTF stores data column-by-column (not row-by-row), uses a Write-Ahead Log for crash safety, supports multi-operation transactions with OCC (LSN-based conflict detection), cost-based query planning, hash/sorted indexing, hash joins, and vector similarity search with HNSW acceleration — all from a single binary with zero runtime dependencies.
 
 ---
 
@@ -34,23 +34,24 @@ This means:
 | Transactions             | ✅ WAL-based | ✅ WAL-based   | ✅ (multi-doc) |
 | Schema constraints       | UNIQUE, NOT NULL, DEFAULT | Full SQL | Optional |
 | Vector search            | ✅ Built-in  | ❌             | ❌ (separate)  |
-| File format              | Plain JSON + binary | SQLite binary | BSON |
-| Human-readable at rest   | ✅           | ❌             | ❌             |
+| File format              | Binary v2 (default) + JSON export | SQLite binary | BSON |
+| Human-readable at rest   | Optional (JSON export) | ❌             | ❌             |
 | Crash recovery           | WAL replay   | WAL replay     | Oplog replay   |
 | Embeds in Rust binary    | ✅           | via C FFI      | ❌             |
 | Server-ready foundation  | ✅ LSN + OCC | ✅             | ✅             |
 
 ---
 
-## What's new in V3
+## What's new in V3.1 + V4
 
-V3 is the release line built on the v2 storage stack (JSON/binary on disk, advisory locking, CRC32 WAL lines). It wires that WAL into the **write path**, adds **CLI aggregations** and **multi-operation transactions**, and extends the format with **LSN** and optional **schema constraints**. The rough split from git history:
+This release wave focuses on correctness and engine maturity: typed index correctness, typed scan hot paths, statistics + `ANALYZE`, cost-based planning with richer `EXPLAIN` output, index consistency checks, hash joins, OCC via LSN, binary format v2 as default storage, and HNSW vector indexes.
 
 | Milestone | What shipped |
 |-----------|----------------|
 | **v2** | Columnar engine, binary + zstd, WAL file format, compaction, file locking |
-| **v3 (wave 1)** | **`save_with_wal` on every mutation**, **`vtf aggregate`**, replay timing logs |
-| **v3 (wave 2)** | **`vtf txn`** + `Transaction` API, `txn_begin` / `txn_commit` in the WAL, crash-safe partial-transaction discard |
+| **v3** | WAL on write path, `vtf aggregate`, `vtf txn`, crash-safe partial-transaction discard |
+| **v3.1** | Typed sorted-index fix, typed scan hot path, stats + `vtf analyze`, cost-based planner, enriched `vtf explain`, `vtf check` |
+| **v4 (current)** | Hash join (`vtf join`), OCC via LSN, binary v2 default save path, HNSW index (`vtf build-vector-index`) |
 
 ### WAL on the hot path
 
@@ -73,7 +74,8 @@ V3 is the release line built on the v2 storage stack (JSON/binary on disk, advis
 
 ### `vtf explain`
 
-- Loads the table (including WAL replay) and prints the **query plan** for a **`--where`** expression: hash index lookup, sorted index range, column scan, and how **`AND` / `OR` / `NOT`** combine. It does **not** print result rows—only how the planner would execute the filter.
+- Loads the table (including WAL replay) and prints the **query plan** for a **`--where`** expression: hash index lookup, sorted index range, column scan, and how **`AND` / `OR` / `NOT`** combine.
+- Output now includes per-node **estimated rows** and **cost** from the cost-based planner.
 
 ### Schema constraints on `vtf create`
 
@@ -81,9 +83,10 @@ V3 is the release line built on the v2 storage stack (JSON/binary on disk, advis
 - **`--not-null "col,col"`** — insert/update may not set those columns to JSON `null`.
 - **`--default '{"col": value}'`** — missing keys on insert are filled before NOT NULL / UNIQUE checks.
 
-### LSN
+### LSN + OCC
 
-- **`lsn`** increments on each successful WAL append and is stored in the table JSON. It is restored after restart and is intended as the hook for **optimistic concurrency** in a future server layer.
+- **`lsn`** increments on each committed write and is persisted in storage.
+- `Transaction::new(&table)` captures `read_lsn`; `commit()` checks for changes and returns `VtfError::OccConflict` when `table.lsn != read_lsn`.
 
 ---
 
@@ -108,7 +111,7 @@ flowchart TD
 
     subgraph Query["Query Engine"]
         Parser["query_parser::parse()\nAST construction"]
-        Planner["plan_query()\n• HashIndexLookup\n• SortedIndexRange\n• ColumnScan\n• Selectivity check (<30%)"]
+        Planner["plan_query()\n• Cost-based PlanNode\n• HashIndexLookup / SortedIndexRange / ColumnScan\n• Stats-aware estimates"]
         Executor["execute()\nApply plan → row indices"]
         Agg["aggregate()\nCOUNT / SUM / AVG / MIN / MAX"]
         Vector["vector_search()\nCosine / Euclidean top-K"]
@@ -116,7 +119,7 @@ flowchart TD
 
     subgraph Storage["Storage Layer"]
         WAL["Write-Ahead Log (.vtf.wal)\nCRC32-checksummed entries\nTransaction markers"]
-        Binary["Binary encoder (.vtfb)\nColumn-wise zstd compression\nProjection pushdown"]
+        Binary["Binary encoder (v2 default save path)\nColumn-wise encoding\nMetadata/index/LSN persistence"]
         JSON["JSON serializer\nHuman-readable, round-trips cleanly"]
         Compact["Compaction\nWAL → base file merge at threshold"]
     end
@@ -148,7 +151,10 @@ flowchart LR
 
 ## File Format
 
-VTF tables are stored on disk as a JSON file (`.vtf`) plus an optional WAL (`.vtf.wal`):
+VTF tables are stored on disk as binary (v2) by default, with an optional WAL (`.vtf.wal`).  
+`io::load` auto-detects JSON, binary v1, and binary v2.
+
+JSON representation (for readability/export):
 
 ```json
 {
@@ -171,9 +177,14 @@ VTF tables are stored on disk as a JSON file (`.vtf`) plus an optional WAL (`.vt
     "defaults": { "score": 0.0 }
   },
   "indexes": {
-    "id": { "type": "hash", "map": { "1": [0], "2": [1], "3": [2] } }
+    "id": {
+      "type": "hash",
+      "columnType": "int",
+      "map": { "1": [0], "2": [1], "3": [2] }
+    }
   },
-  "lsn": 3
+  "lsn": 3,
+  "extensions": {}
 }
 ```
 
@@ -247,7 +258,7 @@ vtf insert events.vtf --row '{"id":1}'
 
 ## Transactions
 
-VTF v3 supports multi-operation transactions with atomicity and crash safety (see [What's new in V3](#whats-new-in-v3)).
+VTF supports multi-operation transactions with atomicity and crash safety (see [What's new in V3.1 + V4](#whats-new-in-v31--v4)).
 
 ### How it works
 
@@ -286,7 +297,7 @@ vtf txn users.vtf --ops '[
 ```rust
 use vtf::engine::transaction::Transaction;
 
-let mut txn = Transaction::new();
+let mut txn = Transaction::new(&table); // captures read_lsn for OCC
 txn.insert(row1);
 txn.delete("id = 5", vec![json!(5)]);
 txn.update("id = 3", vec![json!(3)], updates);
@@ -328,9 +339,9 @@ vtf explain users.vtf --where "age > 25 AND active = true"
 ```
 Query plan for: age > 25 AND active = true
 
-└── Intersect
-    ├── SortedIndexRange(age > 25)  [sorted index]
-    └── ColumnScan(active = true)   [full scan — no index on 'active']
+└── Intersect  [est. rows: 120, cost: 132.4]
+    ├── SortedIndexRange(age > 25)  [sorted index]  [est. rows: 180, cost: 95.4]
+    └── ColumnScan(active = true)   [full scan]     [est. rows: 260, cost: 500.0]
 
 500 rows in table, 1 index(es) available
 ```
@@ -354,21 +365,21 @@ vtf search embeddings.vtf --column vector \
     --metric cosine
 ```
 
-Supported metrics: `cosine`, `euclidean`
+Supported metrics: `cosine`, `euclidean`  
+If an HNSW index exists for the column and metric is cosine, search routes through HNSW; otherwise it falls back to brute-force.
 
 ---
 
-## Planner Selectivity
+## Query Planning (Cost-Based)
 
-The query planner automatically decides whether to use an index or a full column scan based on **selectivity**. If a query matches more than 30% of rows, a full scan is cheaper than index indirection:
+The planner now uses a lightweight cost model:
 
-```
-For "active = true" where 80% of rows are active:
-  → ColumnScan  (index would touch 80% of rows anyway)
+- `scan_cost = row_count`
+- `hash_cost ≈ hit_count + lookup overhead`
+- `sorted_range_cost ≈ estimated_rows + log2(distinct_count)`
 
-For "id = 42" where 1 of 10,000 rows matches:
-  → HashIndexLookup  (highly selective)
-```
+When valid column stats are available (`vtf analyze`), estimates use `distinct_count`, `min`, and `max`.  
+When stats are stale or missing, the planner falls back to heuristics.
 
 ---
 
@@ -400,7 +411,7 @@ On replay, VTF looks up the current row index for each PK — so the WAL is alwa
 
 ## Log Sequence Number (LSN)
 
-Every committed write increments `table.lsn`. The LSN is persisted in the JSON file and restored on reload.
+Every committed write increments `table.lsn`. The LSN is persisted in storage (binary v2 or JSON) and restored on reload.
 
 ```bash
 vtf info users.vtf
@@ -409,12 +420,13 @@ vtf info users.vtf
 # LSN: 47
 ```
 
-The LSN is the foundation for **Optimistic Concurrency Control** when the server layer is added:
+LSN now powers **Optimistic Concurrency Control** in transactions:
 
 ```rust
-// Future server — at transaction commit time:
-if row.last_lsn > transaction.read_lsn {
-    return Err(VtfError::ConflictAbort(...));  // retry
+let mut txn = Transaction::new(&table);
+// ... add ops
+if let Err(VtfError::OccConflict { .. }) = txn.commit(&path, &mut table) {
+    // reload and retry
 }
 ```
 
@@ -426,7 +438,7 @@ VTF is designed to become a server-side database. The current embedded engine is
 
 ```mermaid
 flowchart LR
-    Now["Now (v3)\nEmbedded CLI\nWAL + Transactions\nSchema constraints\nLSN foundation"]
+    Now["Now (v4)\nEmbedded CLI\nWAL + Transactions + OCC\nStats + Cost planner\nHash join + HNSW index"]
 
     S1["Step 1\nArc<RwLock<TableStore>>\nMulti-table in-memory cache\nThread-safe reads"]
 
@@ -448,6 +460,25 @@ Each step builds on the previous:
 ---
 
 ## Quick Start
+
+### 2-minute walkthrough (recommended)
+
+```bash
+# 1) Create + insert
+vtf create users.vtf --columns "id:int,name:string,age:int,active:boolean,embedding:array<float>" --primary-key id
+vtf insert users.vtf --rows '[{"id":1,"name":"Alice","age":30,"active":true,"embedding":[0.1,0.2,0.3]},{"id":2,"name":"Bob","age":25,"active":false,"embedding":[0.3,0.1,0.2]}]'
+
+# 2) Build planner stats + inspect plan
+vtf analyze users.vtf
+vtf explain users.vtf --where "age > 20 AND active = true"
+
+# 3) Build vector index + search
+vtf build-vector-index users.vtf --column embedding
+vtf search users.vtf --column embedding --vector "[0.1,0.2,0.25]" --top-k 2 --metric cosine
+
+# 4) Check index consistency
+vtf check users.vtf
+```
 
 ### Build
 
@@ -495,12 +526,36 @@ vtf aggregate users.vtf --column age --function avg
 vtf aggregate users.vtf --column age --function "count,sum,avg,min,max" --where "active = true"
 ```
 
+### Analyze statistics
+
+```bash
+vtf analyze users.vtf
+```
+
+### Check index consistency
+
+```bash
+vtf check users.vtf
+```
+
 ### Indexes
 
 ```bash
 vtf create-index users.vtf --column name --type hash
 vtf create-index users.vtf --column age --type sorted
 vtf drop-index users.vtf --column name
+```
+
+### Join
+
+```bash
+vtf join users.vtf orders.vtf --on id=user_id --output joined.vtf
+```
+
+### Build vector index
+
+```bash
+vtf build-vector-index docs.vtf --column embedding
 ```
 
 ### Export
@@ -577,6 +632,13 @@ vtf txn <file.vtf> --ops '[
 vtf explain <file.vtf> --where "age > 25 AND active = true"
 ```
 
+### Analyze and consistency checks
+
+```bash
+vtf analyze <file.vtf>
+vtf check <file.vtf>
+```
+
 ### Aggregations
 
 ```bash
@@ -588,6 +650,7 @@ vtf aggregate <file.vtf> --column <col> --function <fn>[,<fn>...] [--where expr]
 
 ```bash
 vtf search <file.vtf> --column col --vector "[...]" --top-k N --metric cosine|euclidean
+vtf build-vector-index <file.vtf> --column <array_float_column>
 ```
 
 ### Index management
@@ -595,6 +658,12 @@ vtf search <file.vtf> --column col --vector "[...]" --top-k N --metric cosine|eu
 ```bash
 vtf create-index <file.vtf> --column col --type hash|sorted
 vtf drop-index <file.vtf> --column col
+```
+
+### Join
+
+```bash
+vtf join <left.vtf> <right.vtf> --on left_col=right_col [--output <joined.vtf>]
 ```
 
 ### Schema
